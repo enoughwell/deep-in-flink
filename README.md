@@ -6,3 +6,7 @@
 另，类似于Flink的分布式计算引擎，如Spark、Storm等在原理上是相近的，深入解析Flink的原理，尽量抽取通用的概念，使读者对于分布式计算引擎领域能够更深的认识，则是更深层次的追求。
 
 另提供了pdf和epub版本供大家阅读！
+
+
+# [**流上的高效模式匹配**](/流上的高效模式匹配论文.md)
+Flink的CEP实现重度参考了论文《[Efficient Pattern Matching over Event Streams](https://people.cs.umass.edu/~immerman/pub/sase+sigmod08.pdf)》，此文是该论文核心部分的中文版。

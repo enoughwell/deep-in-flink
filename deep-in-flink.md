@@ -1,7 +1,5 @@
 
 
-
-
 **<font size=20 textAlign ="center">Deep In Flink</font>**
 
 [TOC]
@@ -5258,6 +5256,279 @@ create_logical_plan --> optimize_logical_plan[4.生成优化的Logical Plan]
 optimize_logical_plan --> physical_plan[5.生成Flink Physical Plan]
 physical_plan --> execute_plan[6.生成Execution Plan]
 ```
+
+
+
+## 关键对象
+
+### Expression
+
+所有表达式的顶层接口，用来表示尚未经过解析的表达式，解析、验证之后成为ResolvedExpression。
+
+![1562221663424](images/1562221663424.png)
+
+Expression可以表达树形的表达式结构。Expression的子类特别多，数学运算、条件运算、逻辑运算、函数调用等都是用Expression表示的。
+
+Expression是一个可以表达一下类型：
+
+- 常量值
+
+- 字段引用
+
+- 函数调用
+
+  所有的表达式运算都用函数来表示，例如数学运算，DIV函数表示除法运算、EqualTo函数表示相等判断。
+
+表达式Expression可以没有、有1个或多个子表达式。
+
+### PlannerExpression
+
+PlannerExpression是有三个子类，表示三类运算：
+
+- BinaryExpression（二元运算）
+- UnaryExpression（一元运算）
+- LeafExpression（叶子节点）
+
+所有的常量值、字段引用、函数调用等都隶属于这3类运算。
+
+
+
+### ResolvedExpression
+
+ResolvedExpression与Expression相比，不包含为解析的子表达式，并且添加了数据的输出类型。
+
+ResolvedExpression包含了如下实现：
+
+![1562146306590](images/1562146306590.png)
+
+**CallExpression**
+
+CallExpression**表示一个解析、验证后的函数调用表达式。其基本属性如下：
+
+<ul>
+	<li>输出类型</li>
+	<li>函数定义(FunctionDefinition)表达被调用的函数</li>
+	<li>可选的ObjectIdentifier，用来追溯函数的来源</li>
+</ul>
+
+> ObjectIdentifier用来表示Catalog中的表、视图、函数、类型等，使用全路径表示。由CatalogManager负责将ObjectIdentifier解析为具体的对象实体。
+>
+> ObjectIdentifier的属性如下：
+>
+> ```java
+> private String catalogName;
+> 
+> private String databaseName;
+> 
+> private String objectName;
+> ```
+
+**ValueLiteralExpression**
+
+表示任何类型常量值的对象，属性如下：
+
+```java
+//对象值
+private final @Nullable Object value;
+//对象类型
+private final DataType dataType;
+```
+
+**TypeLiteralExpression**
+
+将DataType包装为一个常量值，主要用作类型转换运算中。简化了Expression的设计，只有CallExpression接受子表达式。
+
+**LocalReferenceExpression**
+
+用来引用QueryOperation中的本地实体，该实体不是来自于上游的输入。例如引用窗口聚合中的group Window。
+
+**TableReferenceExpression**
+
+引用另一张表的表达式，该表达式只是用在了API层面上，被Planner转换为不相关的子查询。
+
+**FieldReferenceExpression**
+
+引用上游输入中的字段的表达式，包含如下属性：
+
+```java
+//输入字段的名称
+private final String name;
+//输入字段的类型
+private final DataType dataType;
+//字段所属的上游输入，例如join运算，左输入inputIndex为0，右输入inputIndex为1
+private final int inputIndex;
+//字段在对应输入中的索引编号
+private final int fieldIndex;
+```
+
+
+
+<font color=red>待分析。</font>
+
+
+
+### Operation
+
+Operation是所有的Table操作的抽象，包含数据查询（DQL）、数据操作（DML）、数据定义(DDL)、数据控制（DCL）。是Planner.parse(sql)方法解析SQL语句后产生。
+
+![1562138186907](images/1562138186907.png)
+
+#### QueryOperation
+
+SQL查询Operation的抽象接口，表示关系查询树的节点，Table API的调用最终会转换为QueryOperation，每个节点带有Schema，用来校验QueryOperation的合法性。
+
+QueryOperation的实现有以下几种：
+
+- **常规的SQL运算操作**
+
+  Join、Filter、Project、Sort、Distinct、Aggregate、WindowAggregate、Set集合等常规的SQL运算操作。
+
+- **UDF运算**
+
+  CalculatedQueryOperation是表示在表上应用TableFunction的数据结构。
+
+  ```java
+  // table函数
+  private final TableFunction<T> tableFunction;
+  //table函数入参
+  private final List<ResolvedExpression> parameters;
+  //table函数返回类型
+  private final TypeInformation<T> resultType;
+  //schema
+  private final TableSchema tableSchema;
+  ```
+
+- **Catalog查询运算**
+
+  CatalogQueryOperation，表示对元数据目录的查询运算。
+
+- **StreamQueryOperation**运算
+
+  包含DataStreamQueryOperation、JavaDataStreamQueryOperation、ScalaDataStreamQueryOperation三个实现。
+
+  用来表达从DataStream读取数据的QueryOperation。
+
+- **DataSetQueryOperation**
+
+  用来表达从DataSet中读取数据的QueryOperation。
+
+- 读取数据源的运算
+
+  TableSourceQueryOperation、RichTableSourceQueryOperation（带有统计信息的TableSourceQueryOperation，未来会删除）。
+
+  用来表示从数据源读取数据，由org.apache.flink.table.api.TableEnvironment.fromTableSource(TableSource)调用生成。
+
+#### ModifyOperation
+
+待编写。
+
+### Table
+
+Table是Calcite中的表元数据的数据结构，在Flink中继承了Calcite中的Table（AbstractTable）实现了FlinkTable，FlinkTable是Flink的实现中表元数据的抽象基类。
+
+**FlinkTable**
+
+- **InlineTable**
+
+- **DataStreamTable**
+
+  把DataStream包装为Calcite Table。
+
+- **TableSinkTable**
+
+  把TableSink包装为Calcite Table。
+
+- **TableSourceTable**
+
+  把TableSource包装为CalciteTable
+
+- **TableSourceSinkTable**
+
+  把TableSourceSink包装为Calcite Table。
+
+上边提到的FlinkTable及其子类都是Calcite中的Schema元数据信息的包装类，其内部封装的是Flink的TableSink、TableSource、DataStream等数据结构。
+
+### TableSource
+
+数据源的行为、类型的顶层抽象
+
+![1562155489824](images/1562155489824.png)
+
+#### 流上StreamTableSource
+
+定义一个外部流表，提供数据访问。
+
+凡是被当做流表来处理的TabelSource都实现了此接口。
+
+为了实现流批的统一，所以在流上实现了一个抽象类InputFormatTableSource来支持批数据的读取，Hive表的读取就是通过此抽象类来实现的。
+
+#### NestedFieldsProjectableTableSource
+
+支持嵌套字段的Projection下推。
+
+#### FilterableTableSource
+
+支持filter下推的TableSource，目前只有OrcTableSource实现了此接口。
+
+#### BatchTableSource
+
+<font color=red>已经标记为废弃Deprecated。DataSet在未来的版本中也会移除掉，所以此处不做深入介绍。</font>
+
+#### ProjectableTableSource
+
+支持Projection下推的TableSource，CSV、HBase、Orc的TableSource实现了此接口。
+
+#### PartitionableTableSource
+
+支持分区表的读取，目前暂未有实现类。
+
+#### LookupableTableSource
+
+只有一个实现InMemoryLookupableTableSource，将Table保存在内存中，主要用在测试中。
+
+### TableSink
+
+数据输出的顶层抽象。
+
+![1562153915298](images/1562153915298.png)
+
+#### **流上的TableSink**
+
+- **AppendStreamTableSink**
+
+  追加模式的TableSink，支持追加写，不支持更新。
+
+- **UpsertStreamTableSink**
+
+  upsert，有则更新，无则插入，目前只有elasticsearch的table sink实现。
+
+- **RetractStreamTableSink**
+
+  支持召回模式的TableSink，召回模式其实就是流上的update的核心。
+
+#### 批上的TableSink
+
+<font color=red>已经标记为废弃Deprecated。DataSet在未来的版本中也会移除掉，所以此处不做深入介绍。</font>
+
+### 元信息
+
+
+
+## 函数（待编写）
+
+
+
+## SQL优化（待编写）
+
+### 优化规则
+
+#### 逻辑优化
+
+#### 物理优化
+
+通用规则、流规则、批规则
+
+## 代码生成（待编写）
 
 
 
