@@ -1,5 +1,3 @@
-`
-
 **<font size=20 textAlign ="center">Deep In Flink</font>**
 
 [TOC]
@@ -5512,6 +5510,14 @@ Table是Calcite中的表元数据的数据结构，在Flink中继承了Calcite�
 
 ### 元信息
 
+Catalog
+
+#### HiveCatalog
+
+#### 统计信息
+
+统计信息用来在使用CBO(基于代价优化器）进行Sql优化的时候计算代价，选择执行代价最低的关系代数。
+
 
 
 ### Planer
@@ -5566,9 +5572,9 @@ Flink的Planner两个作用：
 
 ```java
 [
-user: VARCHAR, // 用户名
-cTime: TIMESTAMP, // 点击时间
-url: VARCHAR // 用户点击的url
+    user: VARCHAR, // 用户名
+    cTime: TIMESTAMP, // 点击时间
+    url: VARCHAR // 用户点击的url
 ]
 ```
 
@@ -5722,23 +5728,2331 @@ url: VARCHAR // 用户点击的url
 
 Flink对解析部分的改进
 
+
+
 ### 从SqlNode树到RelNode树
 
 如何识别对应的SqlNode转换为RelNode
 
 从CalciteRelNode到FlinkRelNode，以及为什么要这么做？
 
-## SQL优化（待编写）
+## SQL优化（待完善）
 
-Flink使用Calcite的Optimizer作为SQL优化器，
+Flink使用Calcite的Optimizer作为SQL优化器。
 
-### 优化规则
+### Stream优化
 
-#### 逻辑优化
+`FlinkStreamRuleSets.scala`
+
+#### Stream逻辑优化
+
+##### 半连接join规则
+
+
+
+```scala
+val SEMI_JOIN_RULES: RuleSet = RuleSets.ofList(
+    SimplifyFilterConditionRule.EXTENDED,
+    FlinkRewriteSubQueryRule.FILTER,
+    FlinkSubQueryRemoveRule.FILTER,
+    JoinConditionTypeCoerceRule.INSTANCE,
+    FlinkJoinPushExpressionsRule.INSTANCE
+  )
+```
+
+- **SimplifyFilterConditionRule.EXTENDED**
+
+  
+
+- **FlinkRewriteSubQueryRule.FILTER**
+
+  Planner规则，将filter过滤条件中的标量查询重写，如下所示：
+
+  原始语句
+
+  ```sql
+  select * from T1 where (select count(*) from T2) > 0
+  ```
+
+  重写语句
+
+  ```sql
+  select * from T1 where exists (select * from T2)
+  ```
+
+  重写之后的语句使用`FlinkSubQueryRemoveRule`规则转换为为半连接运算。
+
+  没有此规则的话，会使用`SubQueryRemoveRule`规则，原始语句会转换为与聚合之后结果之间的join运算，生成如下的逻辑计划：
+
+  ```javascript
+  {{{
+    LogicalProject(a=[$0], b=[$1], c=[$2])
+    +- LogicalJoin(condition=[$3], joinType=[semi])
+        :- LogicalTableScan(table=[[x, source: [TestTableSource(a, b, c)]]])
+        +- LogicalProject($f0=[IS NOT NULL($0)])
+           +- LogicalAggregate(group=[{}], m=[MIN($0)])
+              +- LogicalProject(i=[true])
+                 +- LogicalTableScan(table=[[y, source: [TestTableSource(d, e, f)]]])
+  }}}
+  ```
+
+  
+
+- `FlinkSubQueryRemoveRule.FILTER`
+
+  Planner规则，将IN和Exists运算转换为semi-join运算，将NOT IN 和 NOT EXISTS转换为 anti-join。
+
+  > 子查询使用RexSubQuery表达式表示。
+
+  子查询可能是相关子查询也可能是非相关子查询。对于相关子查询会被重写为`org.apache.calcite.rel.core.Join`，join类型为SEMI或ANTI。
+
+-  `JoinConditionTypeCoerceRule.INSTANCE`
+
+  Planner规则，将Join条件中的EQUALS(`=`)运算符两侧的运算数强制转换为相同类型，同时不允许NULL值存在。
+
+  对于大多数情况，已经在类型验证期间通过隐式类型强制换换或在SqlNode到RelNode转换期间进行了类型强制转换，此规则只是进行重新检查以确保类型一致，确保在HashJoin shuffle时相同值的有相同的HashCode。
+
+- `FlinkJoinPushExpressionsRule.INSTANCE`
+
+  Planner规则，用来将Join条件中的等值比较表达式下推，如下例所示：
+
+  对于如下表达式
+
+  ```sql
+  emp JOIN dept ON emp.deptno + 1 = dept.deptno
+  ```
+
+  在emp上project操作的时候添加一个字段用来计算emp.deptno + 1，这样在join条件中就不用进行求和计算，只进行等值判断就行了。
+
+  
+
+  > 此规则是从Calcite `org.apache.calcite.rel.rules.JoinPushExpressionsRule`复制而来，做了2个小的修改：
+  >
+  > 1）使用`org.apache.flink.table.plan.util.FlinkRelOptUtil#pushDownJoinConditions`支持SEMI/ANTI Join。
+  >
+  > 2）只下使用了非时间字段的函数调用（所有的表达式都是函数调用）
+
+  
+
+##### 查询去相关之前转换子查询转换规则
+
+
+
+```scala
+/**
+    * Convert sub-queries before query decorrelation.
+    */
+  val TABLE_SUBQUERY_RULES: RuleSet = RuleSets.ofList(
+    SubQueryRemoveRule.FILTER,
+    SubQueryRemoveRule.PROJECT,
+    SubQueryRemoveRule.JOIN
+  )
+```
+
+将Filter、Project、Join中的子查询转换为`org.apache.calcite.rel.core.Correlate`运算，Correlate运算是Nest Loop Join运算，但是与`org.apache.calcite.rel.core.Join`不同，Correlate运算需要输入变量。
+
+Correlate用于表示相关查询。 一种实现策略是将表达式去相关。
+
+<table>
+ <caption>物理运算与逻辑运算的映射关系</caption>
+ <tr><th>物理运算</th><th>逻辑运算</th></tr>
+ <tr><td>NestedLoops</td><td>Correlate(A, B, regular)</td></tr>
+ <tr><td>NestedLoopsOuter</td><td>Correlate(A, B, outer)</td></tr>
+ <tr><td>NestedLoopsSemi</td><td>Correlate(A, B, semi)</td></tr>
+ <tr><td>NestedLoopsAnti</td><td>Correlate(A, B, anti)</td></tr>
+ <tr><td>HashJoin</td><td>EquiJoin(A, B)</td></tr>
+ <tr><td>HashJoinOuter</td><td>EquiJoin(A, B, outer)</td></tr>
+ <tr><td>HashJoinSemi</td><td>SemiJoin(A, B, semi)</td></tr>
+ <tr><td>HashJoinAnti</td><td>SemiJoin(A, B, anti)</td></tr>
+ </table>
+
+##### 扩展规则，将对表的引擎替换为合适的子计划树，可能会创建新的计划节点
+
+
+
+```scala
+/**
+    * Expand plan by replacing references to tables into a proper plan sub trees. Those rules
+    * can create new plan nodes.
+    */
+  val EXPAND_PLAN_RULES: RuleSet = RuleSets.ofList(
+    LogicalCorrelateToJoinFromTemporalTableRule.WITH_FILTER,
+    LogicalCorrelateToJoinFromTemporalTableRule.WITHOUT_FILTER,
+    LogicalCorrelateToJoinFromTemporalTableFunctionRule.INSTANCE,
+    TableScanRule.INSTANCE)
+
+  val POST_EXPAND_CLEAN_UP_RULES: RuleSet = RuleSets.ofList(
+    EnumerableToLogicalTableScan.INSTANCE)
+```
+
+- **`LogicalCorrelateToJoinFromTemporalTableRule.WITH_FILTER`**
+
+  Planner规则，用来匹配关联条件不永为True的temporal table join运算，此处意味着Correlate的右输入是一个Filter。<font color=red>（待研究确认）</font>。
+
+  例如
+
+  ```sql
+  SELECT * FROM MyTable AS T JOIN temporalTest FOR SYSTEM_TIME AS OF T.proctime AS D
+    * ON T.a = D.id
+  ```
+
+- **`LogicalCorrelateToJoinFromTemporalTableRule.WITHOUT_FILTER`**
+
+  Planner规则，用来匹配关联条件永为True的temporal table join运算，此处意味着Correlate的右输入是一个Snapshot。<font color=red>（待研究确认）</font>。
+
+  例如
+
+  ```sql
+  SELECT * FROM MyTable AS T JOIN temporalTest FOR SYSTEM_TIME AS OF T.proctime AS D ON true
+  ```
+
+- **`LogicalCorrelateToJoinFromTemporalTableFunctionRule.INSTANCE`**
+
+  原始的temporal TableFunction join（LATERAL TemporalTableFunction(o.proctime)）是一个Correlate，此规则将temporal TableFunction join重写为Join，Join条件中包装了事件属性和主键的信息。最终Join被转换为物理计划的节点`org.apache.flink.table.plan.nodes.physical.stream.StreamExecTemporalJoin`。
+
+- **`TableScanRule.INSTANCE`**
+
+  调用`org.apache.calcite.rel.logical.LogicalTableScan`转换为新的RelNode。<font color=red>(待研究确认)</font>
+
+- **`EnumerableToLogicalTableScan.INSTANCE`**
+
+  将EnumerableTableScan转换为LogicalTableScan的规则。 
+
+  > 为什么需要此规则？
+  >
+  > 因为Calcite会创建一个EnumerableTableScan解析SQL查询时。 将其转换为LogicalTableScan，因此可以将优化过程与可能由Table API创建的计划合并。
+
+##### 在查询去相关之前转换Table引用规则集
+
+```scala
+ /**
+    * Convert table references before query decorrelation.
+    */
+  val TABLE_REF_RULES: RuleSet = RuleSets.ofList(
+    TableScanRule.INSTANCE,
+    EnumerableToLogicalTableScan.INSTANCE
+  )
+```
+
+上文中已经介绍过，此处不再赘述。
+
+##### 表达式化简规则
+
+```scala
+/**
+    * RuleSet to reduce expressions
+    */
+  private val REDUCE_EXPRESSION_RULES: RuleSet = RuleSets.ofList(
+    ReduceExpressionsRule.FILTER_INSTANCE,
+    ReduceExpressionsRule.PROJECT_INSTANCE,
+    ReduceExpressionsRule.CALC_INSTANCE,
+    ReduceExpressionsRule.JOIN_INSTANCE
+  )
+```
+
+- **`ReduceExpressionsRule.FILTER_INSTANCE`**
+
+  Filter表达式中常量化简，如果条件表达式是一个常量，则对应如下处理
+
+  1）如果常量是**True**，则从**Filter**表达式中删除。
+
+  2）如果常量是**False**或者**NULL**，将表达式替换为空的`org.apache.calcite.rel.core.Values`。
+
+  > `org.apache.calcite.rel.core.Values`，用来表示一个包含0个或者多个常量值的Sequence。
+
+- **`ReduceExpressionsRule.PROJECT_INSTANCE`**
+
+  化简`org.apache.calcite.rel.logical.LogicalProject`中的常量。
+
+- **`ReduceExpressionsRule.CALC_INSTANCE`**
+
+  化简`org.apache.calcite.rel.logical.LogicalCalc`中的常量。
+
+- **`ReduceExpressionsRule.JOIN_INSTANCE`**
+
+  化简`org.apache.calcite.rel.core.Join`中的常量
+
+  
+
+##### 重写coalesce函数为case when 规则
+
+```scala
+/**
+    * RuleSet to rewrite coalesce to case when
+    */
+  private val REWRITE_COALESCE_RULES: RuleSet = RuleSets.ofList(
+    // rewrite coalesce to case when
+    RewriteCoalesceRule.FILTER_INSTANCE,
+    RewriteCoalesceRule.PROJECT_INSTANCE,
+    RewriteCoalesceRule.JOIN_INSTANCE,
+    RewriteCoalesceRule.CALC_INSTANCE
+  )
+```
+
+将Filter条件、Project字段列表、Join条件、Calc表达式中的Colesce函数转换为Case When运算。
+
+
+
+##### 简化where过滤条件和join条件 
+
+
+
+```scala
+ /**
+    * RuleSet to simplify predicate expressions in filters and joins
+    */
+  private val PREDICATE_SIMPLIFY_EXPRESSION_RULES: RuleSet = RuleSets.ofList(
+    SimplifyFilterConditionRule.INSTANCE,
+    SimplifyJoinConditionRule.INSTANCE,
+    JoinConditionTypeCoerceRule.INSTANCE,
+    JoinPushExpressionsRule.INSTANCE
+  )
+```
+
+- `SimplifyFilterConditionRule.INSTANCE`
+
+  Planner规则，在Filter条件上应用多种简化转换，如果simplifySubQuery设置为**true**，该规则同时会简化子查询（`RexSubQuery`）中的Filter条件。
+
+- `SimplifyJoinConditionRule.INSTANCE`
+
+  Planner规则，在Join条件上应用多种简化转换。
+
+  简化示例如下：
+
+  ```sql
+  1）a=b AND b=a -> a=b
+  2）x = 1 AND FALSE -> FALSE
+  3）CAST('123' as integer) -> 123
+  ```
+
+  
+
+- `JoinConditionTypeCoerceRule.INSTANCE`
+
+  上文介绍过了，此处不再赘述。
+
+- `JoinPushExpressionsRule.INSTANCE`
+
+  与`FlinkJoinPushExpressionRule`几乎一样，除了提到的两点修改。
+
+##### 流上的计划规范化规则集
+
+此规则集是一系列规则集的组合。
+
+```scala
+val DEFAULT_REWRITE_RULES: RuleSet = RuleSets.ofList((
+    PREDICATE_SIMPLIFY_EXPRESSION_RULES.asScala ++
+      REWRITE_COALESCE_RULES.asScala ++
+      REDUCE_EXPRESSION_RULES.asScala ++
+      List(
+        StreamLogicalWindowAggregateRule.INSTANCE,
+        // slices a project into sections which contain window agg functions
+        // and sections which do not.
+        ProjectToWindowRule.PROJECT,
+        WindowPropertiesRules.WINDOW_PROPERTIES_RULE,
+        WindowPropertiesRules.WINDOW_PROPERTIES_HAVING_RULE,
+        //ensure union set operator have the same row type
+        new CoerceInputsRule(classOf[LogicalUnion], false),
+        //ensure intersect set operator have the same row type
+        new CoerceInputsRule(classOf[LogicalIntersect], false),
+        //ensure except set operator have the same row type
+        new CoerceInputsRule(classOf[LogicalMinus], false),
+        ConvertToNotInOrInRule.INSTANCE,
+        // optimize limit 0
+        FlinkLimit0RemoveRule.INSTANCE,
+        // unnest rule
+        LogicalUnnestRule.INSTANCE
+      )
+    ).asJava)
+```
+
+- **REWRITE_COALESCE_RULES.asScala** 
+
+  **重写coalesce函数为case when 规则**，前边已经阐述过，不再赘述。
+
+- **REDUCE_EXPRESSION_RULES.asScala**
+
+  **表达式化简规则**，前边已经阐述过，不再赘述。
+
+- **StreamLogicalWindowAggregateRule.INSTANCE**
+
+  将带有窗口表达式，且在`LogicalProject`节点之上的简单`LogicalAggregate`转换为`LogicalWindowAggregate`。
+
+- **ProjectToWindowRule**
+
+  Planner规则，将Project分割成带有窗口聚合函数的部分（`LogicalWindow`）和不带窗口聚合函数的部分（`LogicalProject`）。
+
+- **WindowPropertiesRules.WINDOW_PROPERTIES_RULE**（待研究）
+
+- **WindowPropertiesRules.WINDOW_PROPERTIES_HAVING_RULE**（待研究)
+
+**集合操作**
+
+- 确保**union**的row 类型相同
+
+`new CoerceInputsRule(classOf[LogicalUnion], false)`
+
+- 确保**intersect** 集合运算的row 类型相同
+
+`new CoerceInputsRule(classOf[LogicalIntersect], false)`
+
+- 校验**except**集合运算的row 类型相同
+
+`new CoerceInputsRule(classOf[LogicalMinus], false)`
+
+- **ConvertToNotInOrInRule.INSTANCE**
+
+  将级联的谓词转换为**IN** 或 **NOT IN** 运算。
+
+  **示例：**
+
+  ```sql
+  1. (x = 1 OR x = 2 OR x = 3 OR x = 4) AND y = 5  转换为： x IN (1, 2, 3, 4) AND y = 5
+  2. (x <> 1 AND x <> 2 AND x <> 3 AND x <> 4) AND y = 5 转换为： x NOT IN (1, 2, 3, 4) AND y = 5
+  ```
+
+  
+
+- **FlinkLimit0RemoveRule.INSTANCE**
+
+  优化`limit 0`，将其转换为空的`org.apache.calcite.rel.core.Values`。
+
+- **LogicalUnnestRule.INSTANCE**
+
+  Planner规则，将**UNNEST**转换为**explode**函数。
+
+  > 此规则可以应用在`HepPlanner`中。
+
+##### Filter过滤规则 
+
+```scala
+/**
+    * RuleSet about filter
+    */
+  private val FILTER_RULES: RuleSet = RuleSets.ofList(
+    // push a filter into a join
+    FlinkFilterJoinRule.FILTER_ON_JOIN,
+    // push filter into the children of a join
+    FlinkFilterJoinRule.JOIN,
+    // push filter through an aggregation
+    FilterAggregateTransposeRule.INSTANCE,
+    // push a filter past a project
+    FilterProjectTransposeRule.INSTANCE,
+    // push a filter past a setop
+    FilterSetOpTransposeRule.INSTANCE,
+    FilterMergeRule.INSTANCE
+  )
+```
+
+- **`FlinkFilterJoinRule.FILTER_ON_JOIN`**
+
+  Planner规则，用来将JOIN节点的上层节点Filter条件下推倒Join节点中。
+
+  > 从`org.apache.calcite.rel.rules.FilterJoinRule`复制而来，修复了CALCITE-3170中，anti-join的ON条件无法下推的问题，当Caclite修复此问题后，此规则会删除，仍旧使用Calcite的`org.apache.calcite.rel.rules.FilterJoinRule`。
+
+- **`FlinkFilterJoinRule.JOIN`**
+
+  Planner规则，用来将Join节点中的Filter条件下推到Join节点的子节点中。
+
+- **`FilterAggregateTransposeRule.INSTANCE`**
+
+  Planner规则，在`org.apache.calcite.rel.core.Filter`中识别`org.apache.calcite.rel.core.Aggregate`，将聚合运算下推到Filter节点之下。
+
+  > 在某些情况下，有必要将聚合运算进行分割。
+
+  此规则并不会带来直接的性能提升，（待完善）
+
+- **`FilterProjectTransposeRule.INSTANCE`**
+
+  将Filter下推到Project之下。存在一些限制条件：
+
+  （待完善）
+
+- **`FilterSetOpTransposeRule.INSTANCE`**
+
+  Planner规则，将Filter下推到集合运算之下，集合运算包含：UNION，MINUS (也叫作EXCEPT)和INTERSECT。
+
+- **`FilterMergeRule.INSTANCE`**
+
+  Planner规则，将两个Filter进行合并。
+
+##### 谓词下推规则集
+
+这是一个前边提到的规则的组合，包含：
+
+**Filter过滤规则 + 简化where过滤条件和join条件  + 表达式化简规则**
+
+```scala
+/**
+    * RuleSet to do predicate pushdown
+    */
+  val FILTER_PREPARE_RULES: RuleSet = RuleSets.ofList((
+    FILTER_RULES.asScala
+      // simplify predicate expressions in filters and joins
+      ++ PREDICATE_SIMPLIFY_EXPRESSION_RULES.asScala
+      // reduce expressions in filters and joins
+      ++ REDUCE_EXPRESSION_RULES.asScala
+    ).asJava)
+```
+
+
+
+##### 表扫描下推规则
+
+Planner规则，将Filter下推到`FilterableTableSource`
+
+```scala
+/**
+    * RuleSet to do push predicate into table scan
+    */
+  val FILTER_TABLESCAN_PUSHDOWN_RULES: RuleSet = RuleSets.ofList(
+    // push a filter down into the table scan
+    PushFilterIntoTableSourceScanRule.INSTANCE
+  )
+```
+
+
+
+##### 空结果集剪枝规则
+
+```scala
+/**
+    * RuleSet to prune empty results rules
+    */
+  val PRUNE_EMPTY_RULES: RuleSet = RuleSets.ofList(
+    PruneEmptyRules.AGGREGATE_INSTANCE,
+    PruneEmptyRules.FILTER_INSTANCE,
+    PruneEmptyRules.JOIN_LEFT_INSTANCE,
+    FlinkPruneEmptyRules.JOIN_RIGHT_INSTANCE,
+    PruneEmptyRules.PROJECT_INSTANCE,
+    PruneEmptyRules.SORT_INSTANCE,
+    PruneEmptyRules.UNION_INSTANCE
+  )
+```
+
+
+
+- `PruneEmptyRules.AGGREGATE_INSTANCE`
+
+  如果`org.apache.calcite.rel.core.Aggregate`的子节点为空，则将聚合节点转换为空。
+
+  示例：
+
+  ```sql
+  1）Aggregate(key: [1, 3], Empty)转换为 Empty
+  2）Aggregate(key: [], Empty)不变，没有key的Group By永远返回一行，即便是其输入是Empty。
+  ```
+
+- `PruneEmptyRules.FILTER_INSTANCE`
+
+  如果`org.apache.calcite.rel.logical.LogicalFilter`子节点为空，则将其转换为空。
+
+  示例：
+
+  ```sql
+  Filter(Empty) 转换为 Empty
+  ```
+
+  
+
+- `PruneEmptyRules.JOIN_LEFT_INSTANCE`
+
+  如果`org.apache.calcite.rel.core.Join`的左子节点为空，则将其转换为空。
+
+  示例：
+
+  ```sql
+  Join(Empty, Scan(Dept), INNER) 转换为 Empty
+  ```
+
+  
+
+- `FlinkPruneEmptyRules.JOIN_RIGHT_INSTANCE`
+
+  如果`org.apache.calcite.rel.core.Join`的右子节点为空，则将其转换为空
+
+  从`org.apache.calcite.rel.rules.PruneEmptyRules#JOIN_RIGHT_INSTANCE`复制而来，对Anti-Join做了一些小的改动。
+
+  示例：
+
+  ```sql
+  Join(Scan(Emp), Empty, INNER) 转换为 Empty
+  ```
+
+  **1）Anti-join**
+
+  如下语句：
+
+  ```sql
+  select * from emp where deptno not in (select deptno from dept where 1=0)
+  ```
+
+  如果右子节点为空，则Where条件永为True，那么此时不能转换为空，而是直接输出左子节点的数据即可。
+
+  **2）其他join**
+
+  如果右子节点为空，则一律转换为空。
+
+- `PruneEmptyRules.PROJECT_INSTANCE`
+
+  如果`org.apache.calcite.rel.logical.LogicalProject`子节点为空，则将其转换为空。
+
+  示例：
+
+  ```sql
+  Project(Empty) 转换为 Empty
+  ```
+
+  
+
+- `PruneEmptyRules.SORT_INSTANCE`
+
+  如果`org.apache.calcite.rel.core.Sort`的子节点为空，则将其转换为空。
+
+  示例：
+
+  ```sql
+  Sort(Empty) 转换为 Empty
+  ```
+
+  
+
+- `PruneEmptyRules.UNION_INSTANCE`
+
+  移除`org.apache.calcite.rel.logical.LogicalUnion`的空子节点。
+
+  示例：
+
+  ```sql
+  Union(Rel, Empty, Rel2) 转换为 Union(Rel, Rel2)
+  Union(Rel, Empty, Empty) 转换为 Rel
+  Union(Empty, Empty) 转换为 Empty
+  ```
+
+  
+
+##### Project投影规则
+
+```scala
+ /**
+    * RuleSet about project
+    */
+  val PROJECT_RULES: RuleSet = RuleSets.ofList(
+    // push a projection past a filter
+    ProjectFilterTransposeRule.INSTANCE,
+    // push a projection to the children of a non semi/anti join
+    // push all expressions to handle the time indicator correctly
+    new FlinkProjectJoinTransposeRule(
+      PushProjector.ExprCondition.FALSE, RelFactories.LOGICAL_BUILDER),
+    // push a projection to the children of a semi/anti Join
+    ProjectSemiAntiJoinTransposeRule.INSTANCE,
+    // merge projections
+    ProjectMergeRule.INSTANCE,
+    // remove identity project
+    ProjectRemoveRule.INSTANCE,
+    // reorder sort and projection
+    ProjectSortTransposeRule.INSTANCE,
+    //removes constant keys from an Agg
+    AggregateProjectPullUpConstantsRule.INSTANCE,
+    // push project through a Union
+    ProjectSetOpTransposeRule.INSTANCE
+  )
+```
+
+-  `ProjectFilterTransposeRule.INSTANCE`
+
+  Planner规则，将`org.apache.calcite.rel.core.Project`下推到`org.apache.calcite.rel.core.Filter`之前执行。
+
+- `FlinkProjectJoinTransposeRule`
+
+  Planner规则，从`org.apache.calcite.rel.rules.ProjectJoinTransposeRule`复制而来，做了如下修改：
+
+  > 暂时不匹配SEMI和ANTI Join
+
+  将`org.apache.calcite.rel.core.Project`下推到`org.apache.calcite.rel.core.Join`之前，精简join的左、右输入，保留join和project需要的字段。
+
+- `ProjectSemiAntiJoinTransposeRule.INSTANCE`
+
+  将`org.apache.calcite.rel.core.Project`下推到`org.apache.calcite.rel.core.Join`之前，精简join的左输入，保留join和project需要的字段。
+
+- `ProjectMergeRule.INSTANCE`
+
+  Project合并规则，将两个Project合并为一个Project。
+
+- `ProjectRemoveRule.INSTANCE`
+
+  Project字段删除规则，如果一个Project节点的输出与完全来自于该节点的输入，并且没有任何类型的加工，那么将该Project节点转换为其子节点。
+
+  示例：
+
+  <p><code>Project(ArrayReader(a), {$input0})</code> 转换为 <code>ArrayReader(a)</code></p>
+
+- `ProjectSortTransposeRule.INSTANCE`
+
+  将Project下推到Sort之前。
+
+- `AggregateProjectPullUpConstantsRule.INSTANCE`
+
+  聚合中常量字段删除规则，从`org.apache.calcite.rel.core.Aggregate`中删除常量字段。
+
+  > 常量字段使用`RelMetadataQuery#getPulledUpPredicates(RelNode)`来进行推断。输入不一定必须是`org.apache.calcite.rel.core.Project`。
+
+  该规则不会删除聚合的最后一个字段，因为对于空聚合（`Aggregate([])`）即便是其输入为空，也会返回一行记录。
+
+  转换之后的表达式与转换前的表达式其输出要匹配，所以如果存在常量字段，会在聚合节点之上的Project字段列表中增加删除的常量字段。如果该常量字段并没有被使用到，该规则也不负责删除无用字段，由其他优化规则负责将无用字段优化掉。
+
+- `ProjectSetOpTransposeRule.INSTANCE`
+
+  将Project下推到集合运算之前，集合运算的输入只会输出在Project中需要的字段。
+
+##### Join重排序准备规则
+
+```scala
+ val JOIN_REORDER_PERPARE_RULES: RuleSet = RuleSets.ofList(
+    // merge project to MultiJoin
+    ProjectMultiJoinMergeRule.INSTANCE,
+    // merge filter to MultiJoin
+    FilterMultiJoinMergeRule.INSTANCE,
+    // merge join to MultiJoin
+    JoinToMultiJoinRule.INSTANCE
+  )
+```
+
+- `ProjectMultiJoinMergeRule.INSTANCE`
+
+  Planner规则，将Project下推到（合并）`org.apache.calcite.rel.rules.MultiJoin`中，`MultiJoin`是一个包含N个输入的特殊Join，一般的Join只能有两个输入。
+
+- `FilterMultiJoinMergeRule.INSTANCE`
+
+  Planner规则，将Filter下推到（合并）`org.apache.calcite.rel.rules.MultiJoin`中。
+
+- `JoinToMultiJoinRule.INSTANCE`
+
+  Planner规则，将多个Join节点组成的树展平，形成一个包含多个输入的MultiJoin。
+
+  外连接（outer join）中的可能为null(null generating input)的输入，例如左外连接的右输入或右外连接的左输入，不会被展平。
+
+  Join节点展平到Multi Join的过程中，Join条件也会被放置到MultiJoin中。如果Join的输入null generating，则join不展平，同样Join条件也不会放置到Multi Join中。
+
+  外连接（outer join）的join信息也会保存早Multi Join中，在MultiJoin中使用一个boolean标识位标识是否是一个全外连接（full outer join）。如果是左外连接（left join）、右外连接（right join），join类型和join条件保存在MultiJoin的一个数组中。外连接的join信息会可能为null的输入相关联，例如对于左外连接 A left join B，join信息与B相关联，而不是与A。
+
+  下边的示例中，展示了该规则应用于Join之后生成的MultiJoin。
+
+  示例：
+
+  >  <ul>
+  >   <li>A JOIN B &rarr; MJ(A, B)
+  >    <li>A JOIN B JOIN C &rarr; MJ(A, B, C)
+  >    <li>A LEFT JOIN B &rarr; MJ(A, B), 左外连接（left outer join） JOIN信息与 input#1(即B)相关联
+  >    <li>A RIGHT JOIN B &rarr; MJ(A, B), 右外连接（right outer join on）Join信息与 input#0(即A)相关联
+  >   <li>A FULL JOIN B &rarr; MJ[full](A, B)
+  >   <li>A LEFT JOIN (B JOIN C) &rarr; MJ(A, MJ(B, C))), 左外连接（left outer join）与MultiJoin最外层的
+  >   input#1(即MJ(B, C)) 相关联
+  >   <li>(A JOIN B) LEFT JOIN C &rarr; MJ(A, B, C), 左外连接（left outer join)与input#2（即C）县关联
+  >   <li>(A LEFT JOIN B) JOIN C &rarr; MJ(MJ(A, B), C), 左外连接（left outer join）与 内层的MultiJoin（A, B)的input#1（即B)相关联。
+  >   <li>A LEFT JOIN (B FULL JOIN C) &rarr; MJ(A, MJ[full](B, C)), 左外连接（left outer join）
+  >   与最外层MultiJoin的input#1（即 MJ[full](B, C) 相关联）
+  >   <li>(A LEFT JOIN B) FULL JOIN (C RIGHT JOIN D) &rarr;
+  >        MJ[full](MJ(A, B), MJ(C, D)), 左外连接（left outer join）与 第一个内部MultiJoin（即MJ(A, B)）的的input#1（即B）相关联，右外连接与第二个内部MultiJoin（即MJ(C, D)）的input#0(即C) 相关联
+  >   </ul>
+
+  
+
+##### Join重排序规则
+
+```scala
+val JOIN_REORDER_RULES: RuleSet = RuleSets.ofList(
+    // equi-join predicates transfer
+    RewriteMultiJoinConditionRule.INSTANCE,
+    // join reorder
+    LoptOptimizeJoinRule.INSTANCE
+  )
+```
+
+- `RewriteMultiJoinConditionRule.INSTANCE`
+
+  Planner规则，在MultiJoin的等值Join谓词传递闭包规则。
+
+  示例：
+
+  ```sql
+  MJ(A, B, C) ON A.a1=B.b1 AND B.b1=C.c1 -> MJ(A, B, C) ON A.a1=B.b1 AND B.b1=C.c1 AND A.a1=C.c1
+  ```
+
+  > 这个规则的**优点**是增加在Join重排序过程中的选择，**缺点**是可能会带来更多一点的CPU的消耗。
+
+- `LoptOptimizeJoinRule.INSTANCE`
+
+  Planner规则，用于优化Join的执行顺序。（详细逻辑待续）
+
+##### 流上的逻辑优化规则子集
+
+```scala
+/**
+    * RuleSet to do logical optimize.
+    * This RuleSet is a sub-set of [[LOGICAL_OPT_RULES]].
+    */
+  private val LOGICAL_RULES: RuleSet = RuleSets.ofList(
+    // scan optimization
+    PushProjectIntoTableSourceScanRule.INSTANCE,
+    PushFilterIntoTableSourceScanRule.INSTANCE,
+
+    // reorder sort and projection
+    SortProjectTransposeRule.INSTANCE,
+    // remove unnecessary sort rule
+    SortRemoveRule.INSTANCE,
+
+    // join rules
+    FlinkJoinPushExpressionsRule.INSTANCE,
+
+    // remove union with only a single child
+    UnionEliminatorRule.INSTANCE,
+    // convert non-all union into all-union + distinct
+    UnionToDistinctRule.INSTANCE,
+
+    // aggregation and projection rules
+    AggregateProjectMergeRule.INSTANCE,
+    AggregateProjectPullUpConstantsRule.INSTANCE,
+
+    // remove aggregation if it does not aggregate and input is already distinct
+    FlinkAggregateRemoveRule.INSTANCE,
+    // push aggregate through join
+    FlinkAggregateJoinTransposeRule.LEFT_RIGHT_OUTER_JOIN_EXTENDED,
+    // using variants of aggregate union rule
+    AggregateUnionAggregateRule.AGG_ON_FIRST_INPUT,
+    AggregateUnionAggregateRule.AGG_ON_SECOND_INPUT,
+
+    // reduce aggregate functions like AVG, STDDEV_POP etc.
+    AggregateReduceFunctionsRule.INSTANCE,
+    WindowAggregateReduceFunctionsRule.INSTANCE,
+
+    // reduce useless aggCall
+    PruneAggregateCallRule.PROJECT_ON_AGGREGATE,
+    PruneAggregateCallRule.CALC_ON_AGGREGATE,
+
+    // expand grouping sets
+    DecomposeGroupingSetsRule.INSTANCE,
+
+    // calc rules
+    FilterCalcMergeRule.INSTANCE,
+    ProjectCalcMergeRule.INSTANCE,
+    FilterToCalcRule.INSTANCE,
+    ProjectToCalcRule.INSTANCE,
+    FlinkCalcMergeRule.INSTANCE,
+
+    // semi/anti join transpose rule
+    FlinkSemiAntiJoinJoinTransposeRule.INSTANCE,
+    FlinkSemiAntiJoinProjectTransposeRule.INSTANCE,
+    FlinkSemiAntiJoinFilterTransposeRule.INSTANCE,
+
+    // set operators
+    ReplaceIntersectWithSemiJoinRule.INSTANCE,
+    RewriteIntersectAllRule.INSTANCE,
+    ReplaceMinusWithAntiJoinRule.INSTANCE,
+    RewriteMinusAllRule.INSTANCE
+  )
+```
+
+
+
+**scan优化**
+
+- `PushProjectIntoTableSourceScanRule.INSTANCE`
+
+  Planner规则，将`LogicalProject`下推到`LogicalTableScan`中，包装为Flink的`ProjectableTableSource`或者`NestedFieldsProjectableTableSource`。
+
+-  `PushFilterIntoTableSourceScanRule.INSTANCE`
+
+  Planner规则，将Filter下推到Flink的`FilterableTableSource`中。
+
+**sort与projection重排序**
+
+- SortProjectTransposeRule.INSTANCE
+
+  Planner规则，将Sort下推到Project之前。
+
+**删除无用的Sort规则**
+
+- `SortRemoveRule.INSTANCE`
+
+  Planner规则，如果`org.apache.calcite.rel.core.Sort`的输入已经是排过序的，那么移除此Sort节点。
+
+ **Join下推规则**
+
+- `FlinkJoinPushExpressionsRule.INSTANCE`
+
+  前边已经介绍过此规则，不做赘述。
+
+**移除只有单个子节点的union**
+
+- `UnionEliminatorRule.INSTANCE`
+
+  Planner规则，检查Union节点的输入的数量，如果Union节点只有一个输入，那么Union节点就可以被优化掉。
+
+**转换non-all union为 all-union + distinct**
+
+- `UnionToDistinctRule.INSTANCE`
+
+  Planner规则，将一个distinct union (all = false)，转换为aggregation + non-distinct union（all = true）。
+
+  > union为`org.apache.calcite.rel.core.Union`。
+
+**聚合与Project规则**
+
+- `AggregateProjectMergeRule.INSTANCE`
+
+  Planner规则，识别Aggregation + Projection，如果aggregation可以穿透Projection，那么就移除掉Projection。
+
+  > 只有Aggregation中的group表达式和参数使用的是字段引用，没有使用经过projection加工的表达式的情况下，才有可能移除Projection。
+
+  如果aggregation使用的字段少于Projection列表，此规则有可能简化Projection的输出。
+
+- `AggregateProjectPullUpConstantsRule.INSTANCE`
+
+  在Project投影规则章节中讲过，不再赘述。
+
+**移除aggregation如果聚合无效或者其输入是distinct的 **
+
+- `FlinkAggregateRemoveRule.INSTANCE`
+
+  Planner规则，如果aggregation是不带过滤参数的**SUM, MIN, MAX, AUXILIARY_GROUP**，且其输入已经是distinct，那么移除aggregation节点。
+
+  此规则是从Calctie的`org.apache.calcite.rel.rules.AggregateRemoveRule`复制而来，做了如下的修改：
+
+  1）此规则只匹配简单且非空group。
+
+  2）支持不带过滤参数的聚合函数，包括了：**SUM, MIN, MAX, AUXILIARY_GROUP**。
+
+**push aggregate through join**
+
+- `FlinkAggregateJoinTransposeRule.LEFT_RIGHT_OUTER_JOIN_EXTENDED`
+
+  Planner规则，将Aggregation下推到Join之前。
+
+  此规则是从Calcite`org.apache.calcite.rel.rules.AggregateJoinTransposeRule`复制而来，做了如下修改：
+
+  1）不匹配temporal join，因为lookup表不支持aggregation。
+
+  2）支持左、右外连接。
+
+  3）修复了类型不匹配的错误。
+
+  4）支持带AUXILIARY_GROUP的aggregation。
+
+**using variants of aggregate union rule**
+
+- `AggregateUnionAggregateRule.AGG_ON_FIRST_INPUT`
+
+- `AggregateUnionAggregateRule.AGG_ON_SECOND_INPUT`
+
+  <font color=red>待研究确认</font>
+
+**化简aggregation中的函数**
+
+reduce aggregate functions like AVG, STDDEV_POP etc
+
+- `AggregateReduceFunctionsRule.INSTANCE`
+
+  Planner规则，简化无窗口`org.apache.calcite.rel.core.Aggregate`中的函数。
+
+  示例：
+
+  <ul>
+    <li>AVG(x) &rarr; SUM(x) / COUNT(x)</li><br/>
+    <li>STDDEV_POP(x) &rarr; SQRT(
+        (SUM(x  x) - SUM(x)  SUM(x) / COUNT(x))
+       / COUNT(x))</li><br/>
+    <li>STDDEV_SAMP(x) &rarr; SQRT(
+        (SUM(x  x) - SUM(x)  SUM(x) / COUNT(x))
+        / CASE COUNT(x) WHEN 1 THEN NULL ELSE COUNT(x) - 1 END)</li><br/>
+    <li>VAR_POP(x) &rarr; (SUM(x  x) - SUM(x)  SUM(x) / COUNT(x))
+        / COUNT(x)</li><br/>
+    <li>VAR_SAMP(x) &rarr; (SUM(x  x) - SUM(x)  SUM(x) / COUNT(x))
+           / CASE COUNT(x) WHEN 1 THEN NULL ELSE COUNT(x) - 1 END</li><br/>
+    <li>COVAR_POP(x, y) &rarr; (SUM(x  y) - SUM(x, y)  SUM(y, x)
+        / REGR_COUNT(x, y)) / REGR_COUNT(x, y)</li><br/>
+    <li>COVAR_SAMP(x, y) &rarr; (SUM(x  y) - SUM(x, y)  SUM(y, x) / REGR_COUNT(x, y))
+        / CASE REGR_COUNT(x, y) WHEN 1 THEN NULL ELSE REGR_COUNT(x, y) - 1 END</li><br/>
+    <li>REGR_SXX(x, y) &rarr; REGR_COUNT(x, y)  VAR_POP(y)</li><br/>
+    <li>REGR_SYY(x, y) &rarr; REGR_COUNT(x, y)  VAR_POP(x)</li><br/>
+    </ul>
+
+- `WindowAggregateReduceFunctionsRule.INSTANCE`
+
+  Planner如规则，简化带窗口`org.apache.calcite.rel.core.Aggregate`中的函数，参考规则`AggregateReduceFunctionsRule.INSTANCE`。
+
+**简化无用的aggregation调用**
+
+reduce useless aggCall
+
+- `PruneAggregateCallRule.PROJECT_ON_AGGREGATE`
+
+  从project中移除未被引用的agg call。
+
+- `PruneAggregateCallRule.CALC_ON_AGGREGATE`
+
+  从Calc中移除为被引用的agg call。
+
+**展开grouping sets**
+
+- **DecomposeGroupingSetsRule.INSTANCE**
+
+  Planner规则，此规则应用于带有Group Sets的aggregation和经过`FlinkAggregateExpandDistinctAggregatesRule`规则转换之后带有distinct的aggregation。
+
+  带有Group Sets的aggregation展开重写为普通的aggregation。
+
+  此规则会导致aggregation的输入复制为多份（等同于Group Sets中不重复的Group的数量），可能会多消耗一些内存、网络带宽和CPU计算的资源。
+
+  示例：
+
+  ```sql
+  MyTable: a: INT, b: BIGINT, c: VARCHAR(32), d: VARCHAR(32)
+  
+  原始记录:
+  +-----+-----+-----+-----+
+  |  a  |  b  |  c  |  d  |
+  +-----+-----+-----+-----+
+  |  1  |  1  |  c1 |  d1 |
+  +-----+-----+-----+-----+
+  |  1  |  2  |  c1 |  d2 |
+  +-----+-----+-----+-----+
+  |  2  |  1  |  c1 |  d1 |
+  +-----+-----+-----+-----+
+  
+  示例1 展开DISTINCT aggregates
+  
+  SQL:
+     SELECT a, SUM(DISTINCT b) as t1, COUNT(DISTINCT c) as t2, COUNT(d) as t3 FROM MyTable GROUP BY a
+    
+     Logical plan:
+     {{{
+     LogicalAggregate(group=[{0}], t1=[SUM(DISTINCT $1)], t2=[COUNT(DISTINCT $2)], t3=[COUNT($3)])
+      LogicalTableScan(table=[[builtin, default, MyTable]])
+     }}}
+    
+     Logical plan after `FlinkAggregateExpandDistinctAggregatesRule` applied:
+     {{{
+     LogicalProject(a=[$0], t1=[$1], t2=[$2], t3=[CAST($3):BIGINT NOT NULL])
+      LogicalProject(a=[$0], t1=[$1], t2=[$2], $f3=[CASE(IS NOT NULL($3), $3, 0)])
+       LogicalAggregate(group=[{0}], t1=[SUM($1) FILTER $4], t2=[COUNT($2) FILTER $5],
+         t3=[MIN($3) FILTER $6])
+        LogicalProject(a=[$0], b=[$1], c=[$2], t3=[$3], $g_1=[=($4, 1)], $g_2=[=($4, 2)],
+          $g_3=[=($4, 3)])
+         LogicalAggregate(group=[{0, 1, 2}], groups=[[{0, 1}, {0, 2}, {0}]], t3=[COUNT($3)],
+           $g=[GROUPING($0, $1, $2)])
+          LogicalTableScan(table=[[builtin, default, MyTable]])
+     }}}
+    
+     Logical plan after this rule applied:
+     {{{
+     LogicalCalc(expr#0..3=[{inputs}], expr#4=[IS NOT NULL($t3)], ...)
+      LogicalAggregate(group=[{0}], t1=[SUM($1) FILTER $4], t2=[COUNT($2) FILTER $5],
+        t3=[MIN($3) FILTER $6])
+       LogicalCalc(expr#0..4=[{inputs}], ... expr#10=[CASE($t6, $t5, $t8, $t7, $t9)],
+          expr#11=[1], expr#12=[=($t10, $t11)], ... $g_1=[$t12], ...)
+        LogicalAggregate(group=[{0, 1, 2, 4}], groups=[[]], t3=[COUNT($3)])
+         LogicalExpand(projects=[{a=[$0], b=[$1], c=[null], d=[$3], $e=[1]},
+           {a=[$0], b=[null], c=[$2], d=[$3], $e=[2]}, {a=[$0], b=[null], c=[null], d=[$3], $e=[3]}])
+          LogicalTableSourceScan(table=[[builtin, default, MyTable]], fields=[a, b, c, d])
+     }}}
+    
+     '$e = 1' is equivalent to 'group by a, b'
+     '$e = 2' is equivalent to 'group by a, c'
+     '$e = 3' is equivalent to 'group by a'
+    
+     展开的记录:
+     +-----+-----+-----+-----+-----+
+     |  a  |  b  |  c  |  d  | $e  |
+     +-----+-----+-----+-----+-----+        ---+---
+     |  1  |  1  | null|  d1 |  1  |           |
+     +-----+-----+-----+-----+-----+           |
+     |  1  | null|  c1 |  d1 |  2  | records expanded by record1
+     +-----+-----+-----+-----+-----+           |
+     |  1  | null| null|  d1 |  3  |           |
+     +-----+-----+-----+-----+-----+        ---+---
+     |  1  |  2  | null|  d2 |  1  |           |
+     +-----+-----+-----+-----+-----+           |
+     |  1  | null|  c1 |  d2 |  2  |  records expanded by record2
+     +-----+-----+-----+-----+-----+           |
+     |  1  | null| null|  d2 |  3  |           |
+     +-----+-----+-----+-----+-----+        ---+---
+     |  2  |  1  | null|  d1 |  1  |           |
+     +-----+-----+-----+-----+-----+           |
+     |  2  | null|  c1 |  d1 |  2  |  records expanded by record3
+     +-----+-----+-----+-----+-----+           |
+     |  2  | null| null|  d1 |  3  |           |
+     +-----+-----+-----+-----+-----+        ---+---
+  
+  示例2 (字段同时应用在DISTINCT aggregates和non-DISTINCT aggregates):
+    
+     SQL:
+     SELECT MAX(a) as t1, COUNT(DISTINCT a) as t2, count(DISTINCT d) as t3 FROM MyTable
+    
+     字段 `a` 同时出现在 DISTINCT aggregate and `MAX` aggregate, `a` 被当做两个字段输出, 一个作为`MAX` aggregate的输出,一个作为DISTINCT aggregate的输出.
+    
+     展开之后的结果:
+     +-----+-----+-----+-----+
+     |  a  |  d  | $e  | a_0 |
+     +-----+-----+-----+-----+        ---+---
+     |  1  | null|  1  |  1  |           |
+     +-----+-----+-----+-----+           |
+     | null|  d1 |  2  |  1  |  records expanded by record1
+     +-----+-----+-----+-----+           |
+     | null| null|  3  |  1  |           |
+     +-----+-----+-----+-----+        ---+---
+     |  1  | null|  1  |  1  |           |
+     +-----+-----+-----+-----+           |
+     | null|  d2 |  2  |  1  |  records expanded by record2
+     +-----+-----+-----+-----+           |
+     | null| null|  3  |  1  |           |
+     +-----+-----+-----+-----+        ---+---
+     |  2  | null|  1  |  2  |           |
+     +-----+-----+-----+-----+           |
+     | null|  d1 |  2  |  2  |  records expanded by record3
+     +-----+-----+-----+-----+           |
+     | null| null|  3  |  2  |           |
+     +-----+-----+-----+-----+        ---+---
+    
+     示例3 (展开CUBE/ROLLUP/GROUPING SETS):
+    
+     SQL:
+     SELECT a, c, SUM(b) as b FROM MyTable GROUP BY GROUPING SETS (a, c)
+    
+     Logical plan:
+     {{{
+     LogicalAggregate(group=[{0, 1}], groups=[[{0}, {1}]], b=[SUM($2)])
+      LogicalProject(a=[$0], c=[$2], b=[$1])
+       LogicalTableScan(table=[[builtin, default, MyTable]])
+     }}}
+    
+     Logical plan after this rule applied:
+     {{{
+     LogicalCalc(expr#0..3=[{inputs}], proj#0..1=[{exprs}], b=[$t3])
+      LogicalAggregate(group=[{0, 2, 3}], groups=[[]], b=[SUM($1)])
+       LogicalExpand(projects=[{a=[$0], b=[$1], c=[null], $e=[1]},
+         {a=[null], b=[$1], c=[$2], $e=[2]}])
+        LogicalNativeTableScan(table=[[builtin, default, MyTable]])
+     }}}
+    
+     '$e = 1' 等价于 'group by a'
+     '$e = 2' 等价于 'group by c'
+    
+     展开之后的结果:
+     +-----+-----+-----+-----+
+     |  a  |  b  |  c  | $e  |
+     +-----+-----+-----+-----+        ---+---
+     |  1  |  1  | null|  1  |           |
+     +-----+-----+-----+-----+  records expanded by record1
+     | null|  1  |  c1 |  2  |           |
+     +-----+-----+-----+-----+        ---+---
+     |  1  |  2  | null|  1  |           |
+     +-----+-----+-----+-----+  records expanded by record2
+     | null|  2  |  c1 |  2  |           |
+     +-----+-----+-----+-----+        ---+---
+     |  2  |  1  | null|  1  |           |
+     +-----+-----+-----+-----+  records expanded by record3
+     | null|  1  |  c1 |  2  |           |
+     +-----+-----+-----+-----+        ---+---
+  ```
+  
+  
+
+**Calc 规则**
+
+- **FilterCalcMergeRule.INSTANCE**
+
+  将`org.apache.calcite.rel.logical.LogicalFilter`合并到`org.apache.calcite.rel.logical.LogicalCalc`中，LogicalFilter与LogicalCalc的Filter Condition使用AND语义合并，并写入到LogicalCalc中，返回新的Logical Calc。
+
+- **ProjectCalcMergeRule.INSTANCE**
+
+  Planner规则，将`org.apache.calcite.rel.logical.LogicalProject`合并到`org.apache.calcite.rel.logical.LogicalCalc`中，最终的LogicalCalc与原始的LogicalProject的project字段列表一致，表示为LogicalCalc的输入。
+
+- **FilterToCalcRule.INSTANCE**
+
+  Planner规则，将`org.apache.calcite.rel.logical.LogicalFilter` 转换为 `org.apache.calcite.rel.logical.LogicalCalc`。
+
+  如果该LogicalFilter节点的子节点是LogicalFilter、LogicalProject（此情况会使用`FilterToCalcRule`或`ProjectToCalcRule`规则进行转换）或LogicalCalc，则不会触发该规则。该LogicalFilter节点最终会是使用`FilterCalcMergeRule`规则进行转换。
+
+- **ProjectToCalcRule.INSTANCE**
+
+  此规则，用来将`org.apache.calcite.rel.logical.LogicalProject`转换为`org.apache.calcite.rel.logical.LogicalCalc`。
+
+  如果该LogicalProject节点的子节点是如下，则不会触发该规则:
+
+  1)`LogicalProject`
+
+  2)` LogicalFilter`
+
+  3) `LogicalCalc`
+
+  上边这3种情况触发该规则没有任何问题，但是即便是比转换，经过其他转换之后最终也会转换为LogicalCalc，触发此规则是没必要的资源浪费。
+
+- **FlinkCalcMergeRule.INSTANCE**
+
+  Planner规则，用来将Calc与Calc合并。最终合并后的Calc的输出与上层的Calc的输出一致，体现为下层Calc的输入。
+
+  此规则是从`org.apache.calcite.rel.rules.CalcMergeRule`复制而来，修改如下：
+
+  ​	1）合并后的Calc中如果存在Condition，则进行简化。
+
+  ​	2）如果Calc中包含了非确定（non-deterministic）的表达式，则不进行合并。
+
+**semi/anti join transpose 规则**
+
+- **FlinkSemiAntiJoinJoinTransposeRule.INSTANCE**
+
+  Planner规则，将`org.apache.calcite.rel.core.SemiJoin`下推到`org.apache.calcite.rel.core.Join`之前，目的是触发对Semi Join的转换。
+
+  示例：
+
+  <ul>
+    <li>SemiJoin(LogicalJoin(X, Y), Z) &rarr; LogicalJoin(SemiJoin(X, Z), Y)
+    <li>SemiJoin(LogicalJoin(X, Y), Z) &rarr; LogicalJoin(X, SemiJoin(Y, Z))
+  </ul>
+
+  此规则从`org.apache.calcite.rel.rules.SemiJoinJoinTransposeRule`复制而来，修改如下：
+
+  ​	1）匹配Semi和anti Join，Calcite中的规则只匹配Semi Join。
+
+  ​	2）支持不相关子查询的Exists和NOT Exists。
+
+  ​	示例：
+
+  ```sql
+  SELECT * FROM x, y WHERE x.c = y.f AND EXISTS (SELECT * FROM z)
+  ```
+
+  ​	3）支持Semi/Anti Join的条件中的key，同时来自于Join的左、右输入。
+
+  ​	示例：
+
+  ```sql
+  SELECT * FROM x, y WHERE x.c = y.f AND x.a IN (SELECT z.i FROM z WHERE y.e = z.j)
+  ```
+
+  
+
+- **FlinkSemiAntiJoinProjectTransposeRule.INSTANCE**
+
+  Planner规则，将`org.apache.calcite.rel.core.SemiJoin`下推到`org.apache.calcite.rel.core.Project`之前。目的是触发其他规则对SemiJoin进行转换。
+
+  示例：
+
+  <p>SemiJoin(LogicalProject(X), Y) &rarr; LogicalProject(SemiJoin(X, Y))</p>
+此规则从Calcite的`org.apache.calcite.rel.rules.SemiJoinProjectTransposeRule`复制而来，修改如下：
+  
+
+1）匹配Semi和anti Join，Calcite中的规则只匹配Semi Join。
+
+2）添加谓词，检查Project中的所有表达式都是RexInputRef。
+
+
+
+- **FlinkSemiAntiJoinFilterTransposeRule.INSTANCE**
+
+  Planner规则，将`org.apache.calcite.rel.core.SemiJoin`下推到`org.apache.calcite.rel.core.Filter`之前。目的是触发其他规则对SemiJoin进行转换。
+
+  示例：
+
+  <p>SemiJoin(LogicalFilter(X), Y) &rarr; LogicalFilter(SemiJoin(X, Y))</p>
+此规则从Calcite的`org.apache.calcite.rel.rules.SemiJoinFilterTransposeRule`复制而来，修改如下：
+  
+
+1）匹配Semi和anti Join，Calcite中的规则只匹配Semi Join。
+
+**集合运算规则 operators**
+
+- **ReplaceIntersectWithSemiJoinRule.INSTANCE**
+
+  Planner规则，将distinct Intersect替换为Semi Join + distinct Aggregation。
+
+  > 只适用于2个输入的情况。
+
+- **RewriteIntersectAllRule.INSTANCE**
+
+  Planner规则，将Intersect运算替换为 **union all**, **aggregate**  和 **table function**。
+
+  示例：
+
+  ```sql
+  原始查询语句：
+  
+  SELECT c1 FROM ut1 INTERSECT ALL SELECT c1 FROM ut2
+  
+  转换后：
+  
+  SELECT c1
+  FROM (
+      SELECT c1, If (vcol_left_cnt > vcol_right_cnt, vcol_right_cnt, vcol_left_cnt) AS min_count
+      FROM (
+          SELECT
+          c1,
+          count(vcol_left_marker) as vcol_left_cnt,
+          count(vcol_right_marker) as vcol_right_cnt
+          FROM (
+              SELECT c1, true as vcol_left_marker, null as vcol_right_marker FROM ut1
+              UNION ALL
+              SELECT c1, null as vcol_left_marker, true as vcol_right_marker FROM ut2
+          ) AS union_all
+          GROUP BY c1
+      )
+      WHERE vcol_left_cnt >= 1 AND vcol_right_cnt >= 1)
+  )
+  LATERAL TABLE(replicate_row(min_count, c1)) AS T(c1)
+  ```
+
+  > 只适用于2个输入的情况。
+
+- **ReplaceMinusWithAntiJoinRule.INSTANCE**
+
+  在distinct Minus替换为Anti Join + Aggregate。
+
+  > 只适用于2个输入的情况。
+
+- **RewriteMinusAllRule.INSTANCE**
+
+  Planner规则，将Minus运算替换为 **union all**, **aggregate**  和 **table function**。
+
+  ```sql
+  原始Sql：
+  SELECT c1 FROM ut1 EXCEPT ALL SELECT c1 FROM ut2
+  
+  转换后：
+  SELECT c1
+  FROM (
+      SELECT c1, sum_val
+      FROM (
+          SELECT c1, sum(vcol_marker) AS sum_val
+          FROM (
+              SELECT c1, 1L as vcol_marker FROM ut1
+              UNION ALL
+              SELECT c1, -1L as vcol_marker FROM ut2
+          ) AS union_all
+          GROUP BY union_all.c1
+      )
+      WHERE sum_val > 0
+  )
+  LATERAL TABLE(replicate_row(sum_val, c1)) AS T(c1)
+  ```
+
+  > 只适用于2个输入的情况。
+
+
+
+##### 将Calcite逻辑节点转换为Flink逻辑节点的规则集
+
+```scala
+ /**
+    * RuleSet to translate calcite nodes to flink nodes
+    */
+  private val LOGICAL_CONVERTERS: RuleSet = RuleSets.ofList(
+    // translate to flink logical rel nodes
+    FlinkLogicalAggregate.STREAM_CONVERTER,
+    FlinkLogicalOverAggregate.CONVERTER,
+    FlinkLogicalCalc.CONVERTER,
+    FlinkLogicalCorrelate.CONVERTER,
+    FlinkLogicalJoin.CONVERTER,
+    FlinkLogicalSort.STREAM_CONVERTER,
+    FlinkLogicalUnion.CONVERTER,
+    FlinkLogicalValues.CONVERTER,
+    FlinkLogicalTableSourceScan.CONVERTER,
+    FlinkLogicalTableFunctionScan.CONVERTER,
+    FlinkLogicalDataStreamTableScan.CONVERTER,
+    FlinkLogicalIntermediateTableScan.CONVERTER,
+    FlinkLogicalExpand.CONVERTER,
+    FlinkLogicalWatermarkAssigner.CONVERTER,
+    FlinkLogicalWindowAggregate.CONVERTER,
+    FlinkLogicalSnapshot.CONVERTER,
+    FlinkLogicalMatch.CONVERTER,
+    FlinkLogicalSink.CONVERTER
+  )
+```
+
+顾名思义将Calcite逻辑节点树转换为Flink的物理节点树。
+
+##### 流上的逻辑优化规则总集
+
+```scala
+/**
+* RuleSet to do logical optimize for stream
+*/
+val LOGICAL_OPT_RULES: RuleSet = RuleSets.ofList((
+    FILTER_RULES.asScala ++
+    PROJECT_RULES.asScala ++
+    PRUNE_EMPTY_RULES.asScala ++
+    LOGICAL_RULES.asScala ++
+    LOGICAL_CONVERTERS.asScala
+).asJava)
+```
+
+此规则集是上边规则集的合集，用来优化Logical Tree。
+
+#### Stream物理优化
+
+##### 流上FlinkLogicalRel逻辑节点重写规则
+
+```scala
+ /**
+    * RuleSet to do rewrite on FlinkLogicalRel for Stream
+    */
+  val LOGICAL_REWRITE: RuleSet = RuleSets.ofList(
+    // transform over window to topn node
+    FlinkLogicalRankRule.INSTANCE,
+    // transpose calc past rank to reduce rank input fields
+    CalcRankTransposeRule.INSTANCE,
+    // remove output of rank number when it is a constant
+    RankNumberColumnRemoveRule.INSTANCE,
+    // split distinct aggregate to reduce data skew
+    SplitAggregateRule.INSTANCE,
+    // transpose calc past snapshot
+    CalcSnapshotTransposeRule.INSTANCE,
+    // merge calc after calc transpose
+    FlinkCalcMergeRule.INSTANCE
+  )
+```
+
+- **FlinkLogicalRankRule.INSTANCE**
+
+  Planner规则，匹配`FlinkLogicalOverAggregate`之上的 `FlinkLogicalCalc`  转换为`FlinkLogicalRank`。
+
+- transpose calc past rank to reduce rank input fields
+      **CalcRankTransposeRule.INSTANCE**
+
+  Planner规则，将`FlinkLogicalCalc`下推到`FlinkLogicalRank`，简化`FlinkLogicalRank`的输入。
+
+- remove output of rank number when it is a constant
+  **RankNumberColumnRemoveRule.INSTANCE**
+
+  （待编写）
+
+- **SplitAggregateRule.INSTANCE**
+  
+
+Planner规则，对于包含**distinct**的聚合，例如 **count distinct**，分解为partial aggregation和final aggregation。该规则将包含**distinct**的聚合重写为两个聚合，partial aggregation负责计算每个分区的聚合结果，final aggregation负责将分区聚合的结果汇总输出最终结果。
+
+  **示例：**
+
+  ```sql
+  MyTable: a: BIGINT, b: INT, c: VARCHAR
+  
+  原始记录:
+  +-----+-----+-----+
+  |  a  |  b  |  c  |
+  +-----+-----+-----+
+  |  1  |  1  |  c1 |
+  +-----+-----+-----+
+  |  1  |  2  |  c1 |
+  +-----+-----+-----+
+  |  2  |  1  |  c2 |
+  +-----+-----+-----+
+  
+  SQL:
+  SELECT SUM(b), COUNT(DISTINCT c), AVG(b) FROM MyTable GROUP BY a
+  
+  flink logical plan:
+  {{{
+  FlinkLogicalCalc(select=[a, $f1, $f2, /($f3, $f4) AS $f3])
+  +- FlinkLogicalAggregate(group=[{0}], agg#0=[SUM($2)], agg#1=[$SUM0($3)], agg#2=[$SUM0($4)],
+         agg#3=[$SUM0($5)])
+     +- FlinkLogicalAggregate(group=[{0, 3}], agg#0=[SUM($1) FILTER $4], agg#1=[COUNT(DISTINCT $2)
+            FILTER $5], agg#2=[$SUM0($1) FILTER $4], agg#3=[COUNT($1) FILTER $4])
+        +- FlinkLogicalCalc(select=[a, b, c, $f3, =($e, 1) AS $g_1, =($e, 0) AS $g_0])
+           +- FlinkLogicalExpand(projects=[{a=[$0], b=[$1], c=[$2], $f3=[$3], $e=[0]},
+                  {a=[$0], b=[$1], c=[$2], $f3=[null], $e=[1]}])
+              +- FlinkLogicalCalc(select=[a, b, c, MOD(HASH_CODE(c), 1024) AS $f3])
+                 +- FlinkLogicalTableSourceScan(table=[[MyTable,
+                        source: [TestTableSource(a, b, c)]]], fields=[a, b, c])
+  }}}
+  
+  '$e = 0' 等价于 'group by a, hash(c) % 256'
+  '$e = 1' 等价于 'group by a'
+    *
+  展开之后的记录:
+  +-----+-----+-----+------------------+-----+
+  |  a  |  b  |  c  |  hash(c) % 256   | $e  |
+  +-----+-----+-----+------------------+-----+        ---+---
+  |  1  |  1  | null|       null       |  1  |           |
+  +-----+-----+-----+------------------+-----|  records expanded by record1
+  |  1  |  1  |  c1 |  hash(c1) % 256  |  0  |           |
+  +-----+-----+-----+------------------+-----+        ---+---
+  |  1  |  2  | null|       null       |  1  |           |
+  +-----+-----+-----+------------------+-----+  records expanded by record2
+  |  1  |  2  |  c1 |  hash(c1) % 256  |  0  |           |
+  +-----+-----+-----+------------------+-----+        ---+---
+  |  2  |  1  | null|       null       |  1  |           |
+  +-----+-----+-----+------------------+-----+  records expanded by record3
+  |  2  |  1  |  c2 |  hash(c2) % 256  |  0  |           |
+  +-----+-----+-----+------------------+-----+        ---+---
+  ```
+
+  > 该规则目前只适用于Stream。
+
+- **CalcSnapshotTransposeRule.INSTANCE**
+  
+
+将`FlinkLogicalCalc`下推到`FlinkLogicalSnapshot`。
+
+- **FlinkCalcMergeRule.INSTANCE**
+  
+  前边章节已经阐述，不再赘述。
+  
+  
+
+##### 物理优化规则
+
+```scala
+/**
+    * RuleSet to do physical optimize for stream
+    */
+  val PHYSICAL_OPT_RULES: RuleSet = RuleSets.ofList(
+    FlinkExpandConversionRule.STREAM_INSTANCE,
+    // source
+    StreamExecDataStreamScanRule.INSTANCE,
+    StreamExecTableSourceScanRule.INSTANCE,
+    StreamExecIntermediateTableScanRule.INSTANCE,
+    StreamExecWatermarkAssignerRule.INSTANCE,
+    StreamExecValuesRule.INSTANCE,
+    // calc
+    StreamExecCalcRule.INSTANCE,
+    // union
+    StreamExecUnionRule.INSTANCE,
+    // sort
+    StreamExecSortRule.INSTANCE,
+    StreamExecLimitRule.INSTANCE,
+    StreamExecSortLimitRule.INSTANCE,
+    StreamExecTemporalSortRule.INSTANCE,
+    // rank
+    StreamExecRankRule.INSTANCE,
+    StreamExecDeduplicateRule.RANK_INSTANCE,
+    // expand
+    StreamExecExpandRule.INSTANCE,
+    // group agg
+    StreamExecGroupAggregateRule.INSTANCE,
+    // over agg
+    StreamExecOverAggregateRule.INSTANCE,
+    // window agg
+    StreamExecGroupWindowAggregateRule.INSTANCE,
+    // join
+    StreamExecJoinRule.INSTANCE,
+    StreamExecWindowJoinRule.INSTANCE,
+    StreamExecTemporalJoinRule.INSTANCE,
+    StreamExecLookupJoinRule.SNAPSHOT_ON_TABLESCAN,
+    StreamExecLookupJoinRule.SNAPSHOT_ON_CALC_TABLESCAN,
+    // CEP
+    StreamExecMatchRule.INSTANCE,
+    // correlate
+    StreamExecCorrelateRule.INSTANCE,
+    // sink
+    StreamExecSinkRule.INSTANCE
+  )
+```
+
+- **FlinkExpandConversionRule.STREAM_INSTANCE**
+
+**source**
+
+- **StreamExecDataStreamScanRule.INSTANCE**
+
+  将`FlinkLogicalDataStreamTableScan` 转换为`StreamExecDataStreamScan`。
+
+- **StreamExecTableSourceScanRule.INSTANCE**
+
+  将`FlinkLogicalTableSourceScan` 转换为 `StreamExecTableSourceScan`。
+
+- **StreamExecIntermediateTableScanRule.INSTANCE**
+
+  将`FlinkLogicalIntermediateTableScan` 转换为 `StreamExecIntermediateTableScan`。
+
+- **StreamExecWatermarkAssignerRule.INSTANCE**
+
+  将`FlinkLogicalWatermarkAssigner` 转换为 `StreamExecWatermarkAssigner`。
+
+- **StreamExecValuesRule.INSTANCE**
+
+  将`FlinkLogicalValues`转换为 `StreamExecValues`。
+
+**calc**
+
+- **StreamExecCalcRule.INSTANCE**
+
+  将`FlinkLogicalCalc` 转换为`StreamExecCalc`。
+
+**union**
+
+- **StreamExecUnionRule.INSTANCE**
+
+  将`FlinkLogicalUnion`转换为`StreamExecUnion`。
+
+**sort**
+
+- **StreamExecSortRule.INSTANCE**
+
+  将 `fetch` 为空`fetch` 为0的 `FlinkLogicalSort`转换为`StreamExecSort`。
+
+- **StreamExecLimitRule.INSTANCE**
+
+  将Sort字段为空的`FlinkLogicalSort`转换为`StreamExecLimit`。
+
+- **StreamExecSortLimitRule.INSTANCE**
+
+  将Sort字段不为空，并且`fetch`或者`offset`不为空的`FlinkLogicalSort`转换为`StreamExecSortLimit`。
+
+- **StreamExecTemporalSortRule.INSTANCE**
+
+  将按照时间属性进行升序Sort，并且`fetch`和`offset`为空的`FlinkLogicalSort`转换为`StreamExecTemporalSort`。
+
+**rank**
+
+- **StreamExecRankRule.INSTANCE**
+
+  将带有`fetch`的`FlinkLogicalRank`转换为`StreamExecRank`。
+
+- **StreamExecDeduplicateRule.RANK_INSTANCE**
+
+  将符合如下条件的`FlinkLogicalRank`转换为`StreamExecDeduplicate`：
+
+  1）使用proc-time（处理时间）进行排序；
+
+  2）limits 为1；
+
+  3）rank类型为`ROW_NUMBER`。
+
+  > 可以被转换为`StreamExecDeduplicate`的查询，同样也可以被转换为`StreamExecRank`。由于Mini-batch的的缘故和更少的State访问频率，`StreamExecDeduplicate`的执行效率比`StreamExecRank`高。
+
+  **示例：**
+
+  ```sql
+  1. 示例1
+  SELECT a, b, c FROM (
+     SELECT a, b, c, proctime,
+            ROW_NUMBER() OVER (PARTITION BY a ORDER BY proctime ASC) as row_num
+     FROM MyTable
+   ) WHERE row_num <= 1
+  将被转换为StreamExecDeduplicate，只保留第一行记录。
+  
+  2. 示例2
+  SELECT a, b, c FROM (
+    SELECT a, b, c, proctime,
+           ROW_NUMBER() OVER (PARTITION BY a ORDER BY proctime DESC) as row_num
+    FROM MyTable
+  ) WHERE row_num <= 1
+  被转换为StreamExecDeduplicate，只保留最后一行记录。
+  ```
+
+  
+
+**expand**
+
+- **StreamExecExpandRule.INSTANCE**
+
+  将`FlinkLogicalExpand`转换为`StreamExecExpand`。
+
+**group agg**
+
+- **StreamExecGroupAggregateRule.INSTANCE**
+
+  将`FlinkLogicalAggregate`转换为`StreamExecGroupAggregate`。
+
+**over agg**
+
+- **StreamExecOverAggregateRule.INSTANCE**
+
+  将`FlinkLogicalOverAggregate`转换为`StreamExecOverAggregate`。
+
+  > **注意**
+  >
+  > `StreamExecOverAggregate`**只支持1个**`org.apache.calcite.rel.core.Window.Group`，否则会抛出异常。
+
+**window agg**
+
+- **StreamExecGroupWindowAggregateRule.INSTANCE**
+
+  将`FlinkLogicalWindowAggregate`转换为`StreamExecGroupWindowAggregate`。
+
+**join**
+
+- **StreamExecJoinRule.INSTANCE**
+
+  将join条件中不带Window边界的`FlinkLogicalJoin`转换为`StreamExecJoin`。
+
+- **StreamExecWindowJoinRule.INSTANCE**
+
+  将join条件中带有Window边界的非semi/anti `FlinkLogicalJoin`转换为`StreamExecWindowJoin`。
+
+  > 未来会支持semi/anti join。
+
+- **StreamExecTemporalJoinRule.INSTANCE**
+
+  将`FlinkLogicalTemporalTableJoin`转换为`StreamExecTemporalJoin`。
+
+- **StreamExecLookupJoinRule.SNAPSHOT_ON_TABLESCAN**
+
+  将`FlinkLogicalJoin`(位于`FlinkLogicalSnapshot`计划节点之上)转换为`StreamExecLookupJoin`。
+
+  此规则的应用条件如下：
+
+  1）`FlinkLogicalSnapshot`的最下层Table Source需要实现`org.apache.flink.table.sources.LookupableTableSource`接口；
+
+  2）必须使用左表的proctime属性，作为`FlinkLogicalSnapshot`的时间基准。
+
+- **StreamExecLookupJoinRule.SNAPSHOT_ON_CALC_TABLESCAN**
+
+  （待研究）。
+
+**CEP**
+
+- **StreamExecMatchRule.INSTANCE**
+
+  将`FlinkLogicalMatch`转换为`StreamExecMatch`。
+
+**correlate**
+
+- **StreamExecCorrelateRule.INSTANCE**
+
+  将`FlinkLogicalCorrelate`转换为`StreamExecCorrelate`。
+
+ **sink**
+
+- **StreamExecSinkRule.INSTANCE**
+
+  将`FlinkLogicalSink`转换为`StreamExecSink`。
+
+##### Retract推断规则
+
+```scala
+ /**
+    * RuleSet for retraction inference.
+    */
+  val RETRACTION_RULES: RuleSet = RuleSets.ofList(
+    // retraction rules
+    StreamExecRetractionRules.DEFAULT_RETRACTION_INSTANCE,
+    StreamExecRetractionRules.UPDATES_AS_RETRACTION_INSTANCE,
+    StreamExecRetractionRules.ACCMODE_INSTANCE
+  )
+```
+
+**StreamExecRetractionRules**是一组规则，用来标记`StreamPhysicalRel`的Retract行为。
+
+该组规则必须按照如下顺序使用：
+
+​	**1）StreamExecRetractionRules.DEFAULT_RETRACTION_INSTANCE** 
+
+​	**2）StreamExecRetractionRules.UPDATES_AS_RETRACTION_INSTANCE** 
+
+​	**3）StreamExecRetractionRules.ACCMODE_INSTANCE**
+
+规则在使用的时候会将`AccModeTrait`赋予计划树中的`StreamPhysicalRel`节点。`AccModeTrait`用来在节点上定义**AccMode**。
+
+`AccMode.Acc`表示该节点只会产生Accomulate消息，即所有类型的更改（insert、update、delete）都被编码为Accomulate消息。
+
+`AccMode.AccRetract`表示该节点会产生Accomulate消息和retract消息，insert被编码为**accomulate消息**，delete被编码为**retract消息**，update被编码为**accomulate消息**+**retract消息**的2个消息。
+
+
+
+- **StreamExecRetractionRules.DEFAULT_RETRACTION_INSTANCE**
+
+  设置`StreamPhysicalRel`节点默认retract信息。默认行为下，不将update作为Retract消息和`AccMode.Acc`发布。
+
+- **StreamExecRetractionRules.UPDATES_AS_RETRACTION_INSTANCE**
+
+  标注所有的`StreamPhysicalRel`节点，在向下游发送retract消息的时候，同时要带有update消息。
+
+- **StreamExecRetractionRules.ACCMODE_INSTANCE**
+
+  设置`StreamPhysicalRel`的**AccMode**。
+
+##### Stream exec 执行时的优化规则
+
+LocalAgg聚合优化
+
+```scala
+/**
+* RuleSet to optimize plans after stream exec execution.
+*/
+val PHYSICAL_REWRITE: RuleSet = RuleSets.ofList(
+    //optimize agg rule
+    TwoStageOptimizedAggregateRule.INSTANCE,
+    // incremental agg rule
+    IncrementalAggregateRule.INSTANCE
+)
+```
+
+- **TwoStageOptimizedAggregateRule.INSTANCE**
+
+  在flink物理计划中识别的`StreamExecGroupAggregate`+`StreamExecExchange`，同时要符合如下条件：
+
+  1）在TableConfig中启用了**mini-batch**
+
+  2）在TableConfig中启用了**two-phase aggregation**
+
+  3）所有的聚合函数是可合并的
+
+  4）`StreamExecExchange`的输入不满足shuffle distribution
+
+  将计划重写为
+
+  ```sql
+  StreamExecGlobalGroupAggregate
+     +- StreamExecExchange
+        +- StreamExecLocalGroupAggregate
+           +- input of exchange
+  ```
+
+
+- **IncrementalAggregateRule.INSTANCE**
+
+  在flink物理计划中识别**TwoStageOptimizedAggregateRule.INSTANCE**重写生成的计划：
+
+  ```sql
+  StreamExecGlobalGroupAggregate
+     +- StreamExecExchange
+        +- StreamExecLocalGroupAggregate
+  ```
+
+  将`StreamExecGlobalGroupAggregate`+`StreamExecExchange`+`StreamExecLocalGroupAggregate`转换为`StreamExecIncrementalGroupAggregate`。
+
+  > **该规则目前是实验性质的，未来可能会移除。**
+  >
+  > 当local aggregation和distinct aggregation splitting同时启用的时候，distinct aggregation会被优化成4个aggregation，即：local-agg1，global-agg1、local-agg2、global-agg2，将global-agg1、local-agg2放在同一个operator中（叫做增量聚合，此时该operator接收增量聚合数据，向下游发送增量聚合数据）。使用这种优化方法，可以降低State的压力和资源消耗。
+  >
+  > **该规则默认是开启的**。
+
+  
+
+### Batch优化（待编写）
+
+#### Batch逻辑优化
+
+##### 半连接规则
+
+
+
+```scala
+val SEMI_JOIN_RULES: RuleSet = RuleSets.ofList(
+    SimplifyFilterConditionRule.EXTENDED,
+    FlinkRewriteSubQueryRule.FILTER,
+    FlinkSubQueryRemoveRule.FILTER,
+    JoinConditionTypeCoerceRule.INSTANCE,
+    FlinkJoinPushExpressionsRule.INSTANCE
+  )
+```
+
+
+
+##### 查询去相关之前转换子查询规则
+
+
+
+```scala
+/**
+    * Convert sub-queries before query decorrelation.
+    */
+  val TABLE_SUBQUERY_RULES: RuleSet = RuleSets.ofList(
+    SubQueryRemoveRule.FILTER,
+    SubQueryRemoveRule.PROJECT,
+    SubQueryRemoveRule.JOIN
+  )
+```
+
+
+
+#####  将table的引用展开为对应的计划子树规则
+
+可能会生成新的计划树节点
+
+```scala
+/**
+    * Expand plan by replacing references to tables into a proper plan sub trees. Those rules
+    * can create new plan nodes.
+    */
+  val EXPAND_PLAN_RULES: RuleSet = RuleSets.ofList(
+    LogicalCorrelateToJoinFromTemporalTableRule.WITH_FILTER,
+    LogicalCorrelateToJoinFromTemporalTableRule.WITHOUT_FILTER,
+    TableScanRule.INSTANCE)
+
+  val POST_EXPAND_CLEAN_UP_RULES: RuleSet = RuleSets.ofList(
+    EnumerableToLogicalTableScan.INSTANCE)
+```
+
+
+
+##### 查询去相关之前Table引用转换规则
+
+```scala
+/**
+    * Convert table references before query decorrelation.
+    */
+  val TABLE_REF_RULES: RuleSet = RuleSets.ofList(
+    TableScanRule.INSTANCE,
+    EnumerableToLogicalTableScan.INSTANCE
+  )
+```
+
+
+
+##### 化简表达式规则
+
+```scala
+/**
+    * RuleSet to reduce expressions
+    */
+  private val REDUCE_EXPRESSION_RULES: RuleSet = RuleSets.ofList(
+    ReduceExpressionsRule.FILTER_INSTANCE,
+    ReduceExpressionsRule.PROJECT_INSTANCE,
+    ReduceExpressionsRule.CALC_INSTANCE,
+    ReduceExpressionsRule.JOIN_INSTANCE
+  )
+```
+
+
+
+##### Coalesce函数重写为case when规则
+
+```scala
+/**
+    * RuleSet to rewrite coalesce to case when
+    */
+  private val REWRITE_COALESCE_RULES: RuleSet = RuleSets.ofList(
+    // rewrite coalesce to case when
+    RewriteCoalesceRule.FILTER_INSTANCE,
+    RewriteCoalesceRule.PROJECT_INSTANCE,
+    RewriteCoalesceRule.JOIN_INSTANCE,
+    RewriteCoalesceRule.CALC_INSTANCE
+  )
+```
+
+
+
+##### 简化filter和join中的断言规则
+
+```scala
+/**
+    * RuleSet to simplify predicate expressions in filters and joins
+    */
+  private val PREDICATE_SIMPLIFY_EXPRESSION_RULES: RuleSet = RuleSets.ofList(
+    SimplifyFilterConditionRule.INSTANCE,
+    SimplifyJoinConditionRule.INSTANCE,
+    JoinConditionTypeCoerceRule.INSTANCE,
+    JoinPushExpressionsRule.INSTANCE
+  )
+```
+
+
+
+##### Batch Plan规则化
+
+```scala
+/**
+    * RuleSet to normalize plans for batch
+    */
+  val DEFAULT_REWRITE_RULES: RuleSet = RuleSets.ofList((
+    PREDICATE_SIMPLIFY_EXPRESSION_RULES.asScala ++
+      REWRITE_COALESCE_RULES.asScala ++
+      REDUCE_EXPRESSION_RULES.asScala ++
+      List(
+        // Transform window to LogicalWindowAggregate
+        BatchLogicalWindowAggregateRule.INSTANCE,
+        WindowPropertiesRules.WINDOW_PROPERTIES_RULE,
+        WindowPropertiesRules.WINDOW_PROPERTIES_HAVING_RULE,
+        //ensure union set operator have the same row type
+        new CoerceInputsRule(classOf[LogicalUnion], false),
+        //ensure intersect set operator have the same row type
+        new CoerceInputsRule(classOf[LogicalIntersect], false),
+        //ensure except set operator have the same row type
+        new CoerceInputsRule(classOf[LogicalMinus], false),
+        ConvertToNotInOrInRule.INSTANCE,
+        // optimize limit 0
+        FlinkLimit0RemoveRule.INSTANCE,
+        // unnest rule
+        LogicalUnnestRule.INSTANCE
+      )).asJava)
+```
+
+
+
+##### Filter规则
+
+
+
+```scala
+/**
+    * RuleSet about filter
+    */
+  private val FILTER_RULES: RuleSet = RuleSets.ofList(
+    // push a filter into a join
+    FlinkFilterJoinRule.FILTER_ON_JOIN,
+    // push filter into the children of a join
+    FlinkFilterJoinRule.JOIN,
+    // push filter through an aggregation
+    FilterAggregateTransposeRule.INSTANCE,
+    // push a filter past a project
+    FilterProjectTransposeRule.INSTANCE,
+    FilterSetOpTransposeRule.INSTANCE,
+    FilterMergeRule.INSTANCE
+  )
+```
+
+
+
+##### Join断言重写规则
+
+```scala
+val JOIN_PREDICATE_REWRITE_RULES: RuleSet = RuleSets.ofList(
+    JoinDependentConditionDerivationRule.INSTANCE,
+    JoinDeriveNullFilterRule.INSTANCE
+  )
+```
+
+
+
+##### 下推规则
+
+
+
+```scala
+/**
+    * RuleSet to do predicate pushdown
+    */
+  val FILTER_PREPARE_RULES: RuleSet = RuleSets.ofList((
+    FILTER_RULES.asScala
+      // simplify predicate expressions in filters and joins
+      ++ PREDICATE_SIMPLIFY_EXPRESSION_RULES.asScala
+      // reduce expressions in filters and joins
+      ++ REDUCE_EXPRESSION_RULES.asScala
+    ).asJava
+  )
+```
+
+
+
+##### 断言下推到TableScan规则
+
+```scala
+/**
+    * RuleSet to do push predicate into table scan
+    */
+  val FILTER_TABLESCAN_PUSHDOWN_RULES: RuleSet = RuleSets.ofList(
+    // push a filter down into the table scan
+    PushFilterIntoTableSourceScanRule.INSTANCE
+  )
+```
+
+
+
+##### 空结果集剪枝规则
+
+
+
+```scala
+/**
+    * RuleSet to prune empty results rules
+    */
+  val PRUNE_EMPTY_RULES: RuleSet = RuleSets.ofList(
+    PruneEmptyRules.AGGREGATE_INSTANCE,
+    PruneEmptyRules.FILTER_INSTANCE,
+    PruneEmptyRules.JOIN_LEFT_INSTANCE,
+    FlinkPruneEmptyRules.JOIN_RIGHT_INSTANCE,
+    PruneEmptyRules.PROJECT_INSTANCE,
+    PruneEmptyRules.SORT_INSTANCE,
+    PruneEmptyRules.UNION_INSTANCE
+  )
+```
+
+
+
+##### Project投影规则
+
+
+
+```scala
+/**
+    * RuleSet about project
+    */
+  val PROJECT_RULES: RuleSet = RuleSets.ofList(
+    // push a projection past a filter
+    ProjectFilterTransposeRule.INSTANCE,
+    // push a projection to the children of a non semi/anti join
+    // push all expressions to handle the time indicator correctly
+    new FlinkProjectJoinTransposeRule(
+      PushProjector.ExprCondition.FALSE, RelFactories.LOGICAL_BUILDER),
+    // push a projection to the children of a semi/anti Join
+    ProjectSemiAntiJoinTransposeRule.INSTANCE,
+    // merge projections
+    ProjectMergeRule.INSTANCE,
+    // remove identity project
+    ProjectRemoveRule.INSTANCE,
+    // reorder sort and projection
+    ProjectSortTransposeRule.INSTANCE,
+    //removes constant keys from an Agg
+    AggregateProjectPullUpConstantsRule.INSTANCE,
+    // push project through a Union
+    ProjectSetOpTransposeRule.INSTANCE
+  )
+```
+
+
+
+##### 窗口规则
+
+```scala
+ val WINDOW_RULES: RuleSet = RuleSets.ofList(
+    // slices a project into sections which contain window agg functions and sections which do not.
+    ProjectToWindowRule.PROJECT,
+    //adjust the sequence of window's groups.
+    WindowGroupReorderRule.INSTANCE,
+    // Transform window to LogicalWindowAggregate
+    WindowPropertiesRules.WINDOW_PROPERTIES_RULE,
+    WindowPropertiesRules.WINDOW_PROPERTIES_HAVING_RULE
+  )
+```
+
+
+
+##### JOIN条件等值转换规则
+
+
+
+```scala
+val JOIN_COND_EQUAL_TRANSFER_RULES: RuleSet = RuleSets.ofList((
+    RuleSets.ofList(JoinConditionEqualityTransferRule.INSTANCE).asScala ++
+      PREDICATE_SIMPLIFY_EXPRESSION_RULES.asScala ++
+      FILTER_RULES.asScala
+    ).asJava)
+```
+
+
+
+##### JOIN重排序准备规则
+
+
+
+```scala
+ val JOIN_REORDER_PERPARE_RULES: RuleSet = RuleSets.ofList(
+    // merge join to MultiJoin
+    JoinToMultiJoinRule.INSTANCE,
+    // merge project to MultiJoin
+    ProjectMultiJoinMergeRule.INSTANCE,
+    // merge filter to MultiJoin
+    FilterMultiJoinMergeRule.INSTANCE
+  )
+```
+
+
+
+##### JOIN重写规则
+
+
+
+```scala
+val JOIN_REORDER_RULES: RuleSet = RuleSets.ofList(
+    // equi-join predicates transfer
+    RewriteMultiJoinConditionRule.INSTANCE,
+    // join reorder
+    LoptOptimizeJoinRule.INSTANCE
+  )
+```
+
+
+
+##### 逻辑优化规则
+
+```scala
+/**
+    * RuleSet to do logical optimize.
+    * This RuleSet is a sub-set of [[LOGICAL_OPT_RULES]].
+    */
+  private val LOGICAL_RULES: RuleSet = RuleSets.ofList(
+    // scan optimization
+    PushProjectIntoTableSourceScanRule.INSTANCE,
+    PushFilterIntoTableSourceScanRule.INSTANCE,
+
+    // reorder sort and projection
+    SortProjectTransposeRule.INSTANCE,
+    // remove unnecessary sort rule
+    SortRemoveRule.INSTANCE,
+
+    // join rules
+    FlinkJoinPushExpressionsRule.INSTANCE,
+
+    // remove union with only a single child
+    UnionEliminatorRule.INSTANCE,
+    // convert non-all union into all-union + distinct
+    UnionToDistinctRule.INSTANCE,
+
+    // aggregation and projection rules
+    AggregateProjectMergeRule.INSTANCE,
+    AggregateProjectPullUpConstantsRule.INSTANCE,
+
+    // remove aggregation if it does not aggregate and input is already distinct
+    FlinkAggregateRemoveRule.INSTANCE,
+    // push aggregate through join
+    FlinkAggregateJoinTransposeRule.EXTENDED,
+    // aggregate union rule
+    AggregateUnionAggregateRule.INSTANCE,
+    // expand distinct aggregate to normal aggregate with groupby
+    FlinkAggregateExpandDistinctAggregatesRule.INSTANCE,
+
+    // reduce aggregate functions like AVG, STDDEV_POP etc.
+    AggregateReduceFunctionsRule.INSTANCE,
+    WindowAggregateReduceFunctionsRule.INSTANCE,
+
+    // reduce group by columns
+    AggregateReduceGroupingRule.INSTANCE,
+    // reduce useless aggCall
+    PruneAggregateCallRule.PROJECT_ON_AGGREGATE,
+    PruneAggregateCallRule.CALC_ON_AGGREGATE,
+
+    // expand grouping sets
+    DecomposeGroupingSetsRule.INSTANCE,
+
+    // rank rules
+    FlinkLogicalRankRule.CONSTANT_RANGE_INSTANCE,
+    // transpose calc past rank to reduce rank input fields
+    CalcRankTransposeRule.INSTANCE,
+    // remove output of rank number when it is a constant
+    RankNumberColumnRemoveRule.INSTANCE,
+
+    // calc rules
+    FilterCalcMergeRule.INSTANCE,
+    ProjectCalcMergeRule.INSTANCE,
+    FilterToCalcRule.INSTANCE,
+    ProjectToCalcRule.INSTANCE,
+    FlinkCalcMergeRule.INSTANCE,
+
+    // semi/anti join transpose rule
+    FlinkSemiAntiJoinJoinTransposeRule.INSTANCE,
+    FlinkSemiAntiJoinProjectTransposeRule.INSTANCE,
+    FlinkSemiAntiJoinFilterTransposeRule.INSTANCE,
+
+    // set operators
+    ReplaceIntersectWithSemiJoinRule.INSTANCE,
+    RewriteIntersectAllRule.INSTANCE,
+    ReplaceMinusWithAntiJoinRule.INSTANCE,
+    RewriteMinusAllRule.INSTANCE
+  )
+```
+
+
+
+##### Calcite逻辑节点到Flink逻辑节点转换规则
+
+```scala
+ /**
+    * RuleSet to translate calcite nodes to flink nodes
+    */
+  private val LOGICAL_CONVERTERS: RuleSet = RuleSets.ofList(
+    FlinkLogicalAggregate.BATCH_CONVERTER,
+    FlinkLogicalOverAggregate.CONVERTER,
+    FlinkLogicalCalc.CONVERTER,
+    FlinkLogicalCorrelate.CONVERTER,
+    FlinkLogicalJoin.CONVERTER,
+    FlinkLogicalSort.BATCH_CONVERTER,
+    FlinkLogicalUnion.CONVERTER,
+    FlinkLogicalValues.CONVERTER,
+    FlinkLogicalTableSourceScan.CONVERTER,
+    FlinkLogicalTableFunctionScan.CONVERTER,
+    FlinkLogicalDataStreamTableScan.CONVERTER,
+    FlinkLogicalIntermediateTableScan.CONVERTER,
+    FlinkLogicalExpand.CONVERTER,
+    FlinkLogicalRank.CONVERTER,
+    FlinkLogicalWindowAggregate.CONVERTER,
+    FlinkLogicalSnapshot.CONVERTER,
+    FlinkLogicalSink.CONVERTER
+  )
+```
+
+ 
+
+##### Batch逻辑优化规则总集
+
+
+
+```scala
+/**
+    * RuleSet to do logical optimize for batch
+    */
+  val LOGICAL_OPT_RULES: RuleSet = RuleSets.ofList((
+    FILTER_RULES.asScala ++
+      PROJECT_RULES.asScala ++
+      PRUNE_EMPTY_RULES.asScala ++
+      LOGICAL_RULES.asScala ++
+      LOGICAL_CONVERTERS.asScala
+    ).asJava)
+```
+
+
 
 #### 物理优化
 
-通用规则、流规则、批规则
+##### Batch重写FlinkLogicalRel逻辑节点规则
+
+
+
+```scala
+/**
+    * RuleSet to do rewrite on FlinkLogicalRel for batch
+    */
+  val LOGICAL_REWRITE: RuleSet = RuleSets.ofList(
+    // transpose calc past snapshot
+    CalcSnapshotTransposeRule.INSTANCE,
+    // merge calc after calc transpose
+    FlinkCalcMergeRule.INSTANCE
+  )
+```
+
+
+
+##### Batch物理优化规则
+
+```scala
+ /**
+    * RuleSet to do physical optimize for batch
+    */
+  val PHYSICAL_OPT_RULES: RuleSet = RuleSets.ofList(
+    FlinkExpandConversionRule.BATCH_INSTANCE,
+    // source
+    BatchExecBoundedStreamScanRule.INSTANCE,
+    BatchExecScanTableSourceRule.INSTANCE,
+    BatchExecIntermediateTableScanRule.INSTANCE,
+    BatchExecValuesRule.INSTANCE,
+    // calc
+    BatchExecCalcRule.INSTANCE,
+    // union
+    BatchExecUnionRule.INSTANCE,
+    // sort
+    BatchExecSortRule.INSTANCE,
+    BatchExecLimitRule.INSTANCE,
+    BatchExecSortLimitRule.INSTANCE,
+    // rank
+    BatchExecRankRule.INSTANCE,
+    RemoveRedundantLocalRankRule.INSTANCE,
+    // expand
+    BatchExecExpandRule.INSTANCE,
+    // group agg
+    BatchExecHashAggRule.INSTANCE,
+    BatchExecSortAggRule.INSTANCE,
+    RemoveRedundantLocalSortAggRule.WITHOUT_SORT,
+    RemoveRedundantLocalSortAggRule.WITH_SORT,
+    RemoveRedundantLocalHashAggRule.INSTANCE,
+    // over agg
+    BatchExecOverAggregateRule.INSTANCE,
+    // window agg
+    BatchExecWindowAggregateRule.INSTANCE,
+    // join
+    BatchExecHashJoinRule.INSTANCE,
+    BatchExecSortMergeJoinRule.INSTANCE,
+    BatchExecNestedLoopJoinRule.INSTANCE,
+    BatchExecSingleRowJoinRule.INSTANCE,
+    BatchExecLookupJoinRule.SNAPSHOT_ON_TABLESCAN,
+    BatchExecLookupJoinRule.SNAPSHOT_ON_CALC_TABLESCAN,
+    // correlate
+    BatchExecCorrelateRule.INSTANCE,
+    // sink
+    BatchExecSinkRule.INSTANCE
+  )
+```
+
+
 
 ## 生成执行计划
 
@@ -5753,6 +8067,15 @@ Flink使用Calcite的Optimizer作为SQL优化器，
 ## 自定义函数（待完善）
 
 Flink支持四种类型的自定义函数：
+
+| 函数类型                                                     | 输入与输出                        | 说明                                                         |
+| ------------------------------------------------------------ | --------------------------------- | ------------------------------------------------------------ |
+| **[Scalar Functions](https://ci.apache.org/projects/flink/flink-docs-master/dev/table/udfs.html#scalar-functions)** | 单行输入 ==> 单值输出。           | 标量函数 Scalar Function接收一个或者多个参数，返回一个单值。 |
+| [Table Functions](https://ci.apache.org/projects/flink/flink-docs-master/dev/table/udfs.html#table-functions) | 单行输入 ==> 多行、多列输出。     | 表函数 Table Function接收一个或者多个参数，返回多行、多列的一张表。 |
+| [Aggregation Functions](https://ci.apache.org/projects/flink/flink-docs-master/dev/table/udfs.html#aggregation-functions) | 多行、多列输入 ==> 单值输出       | 聚合函数 Aggregation Function用来在表上做聚合统计，接收一行或者多行作为输入，使用行中的1列或者多列作为入参，计算后返回一个单值。 |
+| [Table Aggregation Functions](https://ci.apache.org/projects/flink/flink-docs-master/dev/table/udfs.html#table-aggregation-functions) | 多行、多列输入 ==> 多行、多列输出 | 表聚合函数，在表上执行聚合运算，输出一张包含多行、多列的表。例如 top n运算。 |
+
+
 
 - **[Scalar Functions](https://ci.apache.org/projects/flink/flink-docs-master/dev/table/udfs.html#scalar-functions)**
 
