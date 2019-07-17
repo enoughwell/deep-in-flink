@@ -1148,6 +1148,15 @@ Checkpoint barrier从source流向中间Operator，一直到Sink。
 
 TwoPhaseCommitSinkFunction考虑了这种场景，因此当应用从checkpoint恢复之后TwoPhaseCommitSinkFunction总是会发起一个抢占式的commit。这种commit必须是幂等性的，虽然大部分情况下这都不是问题。本例中对应的这种场景就是：临时文件不在临时目录下，而是已经被移动到目标目录下。
 
+#### 总结
+
+本文的一些关键要点：
+1. Flinkcheckpointing机制是实现两阶段提交协议以及提供Exactly Once的基础。
+2. 与其他系统持久化传输中的数据不同，Flink不需要将计算的每个阶段写入到磁盘中——而这是很多批处理应用的方式
+3. Flink新的`TwoPhaseCommitSinkFunction`封装两阶段提交协议的公共逻辑使之搭配支持事务的外部系统来共同构建EOS应用成为可能
+4. 自1.4版本起，Flink + Pravega和Kafka 0.11 producer开始支持Exactly Once。
+5. Flink Kafka 0.11 producer基于`TwoPhaseCommitSinkFunction`实现，比起至少一次语义的producer而言开销并未显著增加。
+
 ## Flink State原理
 
 ### State的类型和作用
