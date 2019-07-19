@@ -1022,7 +1022,7 @@ Marker sending rule for process Pi`
 
 ### End-to-End Exactly Once
 
-**Exactly Once语义的问题**
+#### Exactly Once语义的问题
 
 ![img](images/1064041-20180511160832591-1077106111.png)
 
@@ -1038,7 +1038,7 @@ Marker sending rule for process Pi`
 
 ​		所以Flink设计实现了一种**两阶段提交协议**，能够保证从Source->计算->Sink整个过程的端到端Exactly Once，无论是什么原因导致的Job失败，都保证数据严格读取、处理、写入一次。
 
-#### 端到端的Exactly Once实例
+#### 端到端的Exactly Once示例
 
 在本例中，从Kafka中读取数据，处理之后，将处理结果写回到Kafka。**Kafka 0.11.0.0版本正式发布了对于事务的支持——这是与Kafka交互的Flink应用要实现端到端Exactly Once的必要条件。**
 
@@ -1060,8 +1060,8 @@ Marker sending rule for process Pi`
 
 如上图所示，本例中的Flink应用包含以下组件：
 1. 一个**source**，从Kafka中读取数据（即KafkaConsumer）
-2. 一个基于时间窗口化的聚合运算
-3. 一个sink，将结果写回到Kafka（即KafkaProducer）
+2. 一个基于时间窗口化的聚合运算（即window + window 函数）
+3. 一个**sink**，将结果写回到Kafka（即KafkaProducer）
 
 如果要实现端到端的Exactly Once，Sink必须以事务的方式写数据到Kafka，这样当提交事务时两次checkpoint间的所有写入操作当作为一个事务被提交，确保出现故障或崩溃时这些写入操作能够被回滚。
 
@@ -1153,7 +1153,7 @@ TwoPhaseCommitSinkFunction考虑了这种场景，因此当应用从checkpoint�
 本文的一些关键要点：
 1. Flinkcheckpointing机制是实现两阶段提交协议以及提供Exactly Once的基础。
 2. 与其他系统持久化传输中的数据不同，Flink不需要将计算的每个阶段写入到磁盘中——而这是很多批处理应用的方式
-3. Flink新的`TwoPhaseCommitSinkFunction`封装两阶段提交协议的公共逻辑使之搭配支持事务的外部系统来共同构建EOS应用成为可能
+3. Flink新的`TwoPhaseCommitSinkFunction`封装两阶段提交协议的公共逻辑使之搭配支持事务的外部系统来共同构建端到端Exactly Once应用成为可能
 4. 自1.4版本起，Flink + Pravega和Kafka 0.11 producer开始支持Exactly Once。
 5. Flink Kafka 0.11 producer基于`TwoPhaseCommitSinkFunction`实现，比起至少一次语义的producer而言开销并未显著增加。
 
@@ -2749,24 +2749,32 @@ ExecutionJobVertex方法，用来将一个个JobVertex封装成ExecutionJobVerte
 
 将`JobGraph`按照拓扑排序后得到一个`JobVertex`集合，遍历该`JobVertex`集合，即从`source`开始，将`JobVertex`封装成`ExecutionJobVertex`，并依次创建`ExecutionVertex`、`Execution`、`IntermediateResult`和`IntermediateResultPartition`。然后通过`ejv.connectToPredecessor()`方法，创建`ExecutionEdge`，建立当前节点与其上游节点之间的联系，即连接`ExecutionVertex`和`IntermediateResultPartition`。
 
-# Flink调度
+# Flink调度&执行
 
-## 调度模式
+## 调度
 
-Apache Flink内部提供了两种调度模式，分别为：**LAZY_FROM_SOURCES**(批处理）,**EAGER**（流计算）。
+### 调度模式
+
+Apache Flink内部提供了3种调度模式，分别为：**LAZY_FROM_SOURCES**(批处理）,**EAGER**（流计算）。
 
 ```java
 public enum ScheduleMode {
 
 	/** 批的lazy模式，从Source开始，下游的Task的输入数据准备好之后，调度下游的Task开始执行*/
 	LAZY_FROM_SOURCES,
-
+	/**
+	 * Same as LAZY_FROM_SOURCES just with the difference that it uses batch slot requests which support the
+	 * execution of jobs with fewer slots than requested. However, the user needs to make sure that the job
+	 * does not contain any pipelined shuffles (every pipelined region can be executed with a single slot).
+	 */
+	LAZY_FROM_SOURCES_WITH_BATCH_SLOT_REQUEST(true),
+    
 	/** 流的全量模式，一次性申请所有的资源 */
 	EAGER;
 }
 ```
 
-### LAZY_FROM_SOURCES模式
+#### LAZY_FROM_SOURCES模式
 
 **ExecutionJobVertex**代表某个**operation**，如**map**。在这里根据**ExecutionGraph**中**ExecutionJobVertex**的顺序来依次初始化。当使用到当前**task**时，再去调度。
 
@@ -2796,7 +2804,9 @@ private CompletableFuture<Void> scheduleLazy(SlotProvider slotProvider) {
 
 
 
-### EAGER模式
+#### LAZY_FROM_SOURCES_WITH_BATCH_SLOT_REQUEST模式（待编写）
+
+#### EAGER模式
 
 如果采用**EAGER**方式的话，是先调用**allocateResourcesForAll**来分配所需的所有资源，然后才是把所有的**task**部署到对应的TaskManager上。
 
@@ -2895,7 +2905,126 @@ private CompletableFuture<Void> scheduleEager(SlotProvider slotProvider, final T
 }
 ```
 
+### 内部实现
 
+![1563413637847](images/1563413637847.png)
+
+## 执行模式
+
+执行模式指定批处理程序在数据交换方面的执行方式：pipeline模式（流水线）或batch模式。
+
+```java
+public enum ExecutionMode {
+
+	PIPELINED,
+
+	PIPELINED_FORCED,
+	
+    //未来实现
+	//PIPELINED_WITH_BATCH_FALLBACK,
+    
+	BATCH,
+
+	BATCH_FORCED
+	
+}
+```
+
+1. **PIPELINED**
+
+   以流水线方式（包括shuffle和broadcast数据）执行Job，但流水线可能会出现死锁的数据交换除外。 如果可能会出现数据交换死锁，则数据交换以**BATCH**方式执行。
+
+   **示例**
+
+   当数据流被多个下游分支消费处理，然后处理后的结果进行Join的时候，如果以Pipelined模式运行，则可能出现数据交换死锁。
+
+   ```java
+   DataSet data = ...;
+   DataSet mapped1 = data.map(new MyMapper());
+   DataSet mapped2 = data.map(new AnotherMapper());
+   mapped1.join(mapped2).where(...).equalTo(...);
+   ```
+
+2. **PIPELINED_FORCED**
+
+   以流水线方式（包括shuffle和broadcast数据）执行Job，即便是流水线可能会出现死锁的数据交换时。 
+
+   一般情况下，`PIPELINED`模式是优先选择，可能出现数据死锁的情况下才会使用`PIPELINED_FORCED`模式。
+
+3. **PIPELINED_WITH_BATCH_FALLBACK**
+
+   <font color=red>此模式当前未实现</font>。
+
+   此模式首先使用`PIPELINED`启动job，如果可能死锁则`PIPELINED_FORCED`启动job。当Job异常退出时，则使用`BATCH`模式重新执行Job。
+
+4. **BATCH**
+
+   对于所有的shuffle和broadcast都使用`BATCH`模式执行，仅本地的数据交换使用**PIPELINED**模式。
+
+5. **BATCH_FORCED**
+
+   对于所有的数据交换，都使用`BATCH`模式，对于本地交换也不例外。
+
+## 数据交换模式
+
+`ResultPartitionType`中定义了4中类型的数据交换模式，如下
+
+```java
+public enum ResultPartitionType {
+
+	BLOCKING(false, false, false, false),
+
+	BLOCKING_PERSISTENT(false, false, false, true),
+
+	PIPELINED(true, true, false, false),
+
+	PIPELINED_BOUNDED(true, true, true, false);
+}
+```
+
+1. **BLOCKING**
+
+   `BLOCKING` partition会等待数据完全的处理完毕，然后才会交给下游进行处理，在上游处理完毕之前，不会与下游进行数据交换。该模式只适用于有限数据流，即批处理。
+
+   `BLOCKING` partition可以被多次消费，也可以并发消费。
+
+   `BLOCKING` partition被消费完毕之后不会自动释放，而是等待调度器来判断该partition无人再消费之后，由调度器发出销毁指令。
+
+2. **BLOCKING_PERSISTENT**
+
+   `BLOCKING_PERSISTENT` partition类似于 `BLOCKING` partition，但是其生命周期由用户指定。
+
+   调用JobManager或者ResourceManager API进行销毁，而不是由调度器控制。
+
+3. **PIPELINED**
+
+   `PIPELINED`（流水线）式数据交换，适用于有限、无限数据流。
+
+   数据处理结果只能被1个消费者（下游的Operator）消费1次，当数据被消费之后即自动销毁。
+
+   `PIPELINED` partition可能会保存一定数据的数据，与`PIPELINED_BOUNDED`相反。此结果分区类型可以在运行中保留任意数量的数据。
+
+   > 数据量太大内存无法容纳，可以写入到磁盘中。
+
+4. **PIPELINED_BOUNDED**
+
+   `PIPELINED_BOUNDED`是`PIPELINED`带有一个有限大小的本地缓冲池。
+
+   对于Stream Job来说，固定大小的缓冲池，可以避免缓冲太多的数据和checkpoint barrier延迟太久。不同于限制整体的Network buffer pool的大小，该模式下，允许根据partition的总数弹性的选择network buffer pool的大小。
+
+   对于Batch Job来说，最好使用无限制的`PIPELINED`数据交换模式，因为在Batch模式下没有checkpoint barriers，其实现Exactly Once与Stream 不同。
+
+## 数据传输策略
+
+对于跨网络的数据数据处理而言，高吞吐和低延迟是一对矛盾体。
+
+**高吞吐**
+
+Flink不是一个一个地发送每个记录，而是将一堆记录缓冲到其网络缓冲区中，当超过允许事件或者缓冲区满的时候，批量发送记录。降低了每个记录的成本，能够实现更高的吞吐量。
+
+**低延迟**
+
+有些时候，数据来的慢，缓冲区迟迟写不满，降低等待时间，不用等待缓冲区写满即向外发送，能够降低数据的处理延迟，相应的吞吐量会下降。
 
 # Flink执行Task
 
@@ -5247,7 +5376,7 @@ Calcite的主要功能如下
 
   将物理执行计划生成为在特定平台/引擎的可执行程序，如生成符合Mysql or Oracle等不同平台规则的SQL查询语句等
 
-- **~~数据连接与执行~~**
+- **数据连接与执行**
 
   通过各个执行平台执行查询，得到输出结果。
 
@@ -5337,6 +5466,165 @@ LogicalFilter(condition=[>($1, 10)])
 
 ​		Calcite 提供了灵活的机制，可以根据需要，自定义关系运算符、规划规则、成本模型和相关的统计，从而进行不同的取舍，适应于各种场景，这也是Calcite作为框架的初衷。
 
+### SQL语法定义
+
+```sql
+statement:
+      setStatement
+  |   resetStatement
+  |   explain
+  |   describe
+  |   insert
+  |   update
+  |   merge
+  |   delete
+  |   query
+
+statementList:
+      statement [ ';' statement ]* [ ';' ]
+
+setStatement:
+      [ ALTER ( SYSTEM | SESSION ) ] SET identifier '=' expression
+
+resetStatement:
+      [ ALTER ( SYSTEM | SESSION ) ] RESET identifier
+  |   [ ALTER ( SYSTEM | SESSION ) ] RESET ALL
+
+explain:
+      EXPLAIN PLAN
+      [ WITH TYPE | WITH IMPLEMENTATION | WITHOUT IMPLEMENTATION ]
+      [ EXCLUDING ATTRIBUTES | INCLUDING [ ALL ] ATTRIBUTES ]
+      [ AS JSON | AS XML ]
+      FOR ( query | insert | update | merge | delete )
+
+describe:
+      DESCRIBE DATABASE databaseName
+   |  DESCRIBE CATALOG [ databaseName . ] catalogName
+   |  DESCRIBE SCHEMA [ [ databaseName . ] catalogName ] . schemaName
+   |  DESCRIBE [ TABLE ] [ [ [ databaseName . ] catalogName . ] schemaName . ] tableName [ columnName ]
+   |  DESCRIBE [ STATEMENT ] ( query | insert | update | merge | delete )
+
+insert:
+      ( INSERT | UPSERT ) INTO tablePrimary
+      [ '(' column [, column ]* ')' ]
+      query
+
+update:
+      UPDATE tablePrimary
+      SET assign [, assign ]*
+      [ WHERE booleanExpression ]
+
+assign:
+      identifier '=' expression
+
+merge:
+      MERGE INTO tablePrimary [ [ AS ] alias ]
+      USING tablePrimary
+      ON booleanExpression
+      [ WHEN MATCHED THEN UPDATE SET assign [, assign ]* ]
+      [ WHEN NOT MATCHED THEN INSERT VALUES '(' value [ , value ]* ')' ]
+
+delete:
+      DELETE FROM tablePrimary [ [ AS ] alias ]
+      [ WHERE booleanExpression ]
+
+query:
+      values
+  |   WITH withItem [ , withItem ]* query
+  |   {
+          select
+      |   selectWithoutFrom
+      |   query UNION [ ALL | DISTINCT ] query
+      |   query EXCEPT [ ALL | DISTINCT ] query
+      |   query MINUS [ ALL | DISTINCT ] query
+      |   query INTERSECT [ ALL | DISTINCT ] query
+      }
+      [ ORDER BY orderItem [, orderItem ]* ]
+      [ LIMIT [ start, ] { count | ALL } ]
+      [ OFFSET start { ROW | ROWS } ]
+      [ FETCH { FIRST | NEXT } [ count ] { ROW | ROWS } ONLY ]
+
+withItem:
+      name
+      [ '(' column [, column ]* ')' ]
+      AS '(' query ')'
+
+orderItem:
+      expression [ ASC | DESC ] [ NULLS FIRST | NULLS LAST ]
+
+select:
+      SELECT [ STREAM ] [ ALL | DISTINCT ]
+          { * | projectItem [, projectItem ]* }
+      FROM tableExpression
+      [ WHERE booleanExpression ]
+      [ GROUP BY { groupItem [, groupItem ]* } ]
+      [ HAVING booleanExpression ]
+      [ WINDOW windowName AS windowSpec [, windowName AS windowSpec ]* ]
+
+selectWithoutFrom:
+      SELECT [ ALL | DISTINCT ]
+          { * | projectItem [, projectItem ]* }
+
+projectItem:
+      expression [ [ AS ] columnAlias ]
+  |   tableAlias . *
+
+tableExpression:
+      tableReference [, tableReference ]*
+  |   tableExpression [ NATURAL ] [ ( LEFT | RIGHT | FULL ) [ OUTER ] ] JOIN tableExpression [ joinCondition ]
+  |   tableExpression CROSS JOIN tableExpression
+  |   tableExpression [ CROSS | OUTER ] APPLY tableExpression
+
+joinCondition:
+      ON booleanExpression
+  |   USING '(' column [, column ]* ')'
+
+tableReference:
+      tablePrimary
+      [ FOR SYSTEM_TIME AS OF expression ]
+      [ matchRecognize ]
+      [ [ AS ] alias [ '(' columnAlias [, columnAlias ]* ')' ] ]
+
+tablePrimary:
+      [ [ catalogName . ] schemaName . ] tableName
+      '(' TABLE [ [ catalogName . ] schemaName . ] tableName ')'
+  |   tablePrimary [ EXTEND ] '(' columnDecl [, columnDecl ]* ')'
+  |   [ LATERAL ] '(' query ')'
+  |   UNNEST '(' expression ')' [ WITH ORDINALITY ]
+  |   [ LATERAL ] TABLE '(' [ SPECIFIC ] functionName '(' expression [, expression ]* ')' ')'
+
+columnDecl:
+      column type [ NOT NULL ]
+
+values:
+      VALUES expression [, expression ]*
+
+groupItem:
+      expression
+  |   '(' ')'
+  |   '(' expression [, expression ]* ')'
+  |   CUBE '(' expression [, expression ]* ')'
+  |   ROLLUP '(' expression [, expression ]* ')'
+  |   GROUPING SETS '(' groupItem [, groupItem ]* ')'
+
+window:
+      windowName
+  |   windowSpec
+
+windowSpec:
+      '('
+      [ windowName ]
+      [ ORDER BY orderItem [, orderItem ]* ]
+      [ PARTITION BY expression [, expression ]* ]
+      [
+          RANGE numericOrIntervalExpression { PRECEDING | FOLLOWING }
+      |   ROWS numericExpression { PRECEDING | FOLLOWING }
+      ]
+      ')'
+```
+
+
+
 ## Flink与Calcite关系
 
 ![1561539147692](images/1561539147692.png)
@@ -5361,6 +5649,8 @@ Table API与Batch&StreamingSQL（以下简称Sql）在底层的处理上是相�
 >
 > 在Flink中调用了**StreamTableEnvironment**中的**optimize**方法用来进行优化
 
+
+
 ### 从Logical Plan到 DataStream&DataSet程序
 
 ![1561540194747](images/1561540194747.png)
@@ -5371,6 +5661,8 @@ Table API与Batch&StreamingSQL（以下简称Sql）在底层的处理上是相�
 
 ### SQL Query的执行过程
 
+一条stream sql从提交到calcite解析、优化最后到flink引擎执行，一般分为以下几个阶段:
+
 ```mermaid
 graph TB
 sql_parse[1.sql parser] --> sql_validate[2.Sql Validator] 
@@ -5379,6 +5671,71 @@ create_logical_plan --> optimize_logical_plan[4.生成优化的Logical Plan]
 optimize_logical_plan --> physical_plan[5.生成Flink Physical Plan]
 physical_plan --> execute_plan[6.生成Execution Plan]
 ```
+
+1. **Sql Parser**
+
+   将sql语句通过java cc解析成AST(语法树),在calcite中用SqlNode表示AST;
+
+2. **Sql Validator**
+
+   结合数字字典(catalog)去验证sql语法；
+
+3. **生成Logical Plan**
+
+    将sqlNode表示的AST转换成LogicalPlan, 用relNode表示;
+
+4. **生成 optimized LogicalPlan**
+
+   先基于calcite rules >去优化logical Plan, 再基于flink定制的一些优化rules去优化logical Plan；
+
+5. **生成Flink PhysicalPlan**
+
+   这里也是基于flink里头的rules，将optimized LogicalPlan转成成Flink的物理执行计划；
+
+6. **将物理执行计划转成Flink ExecutionPlan**
+
+    就是调用相应的tanslateToPlan方法转换和利用CodeGen元编程成Flink的各种算子。
+
+### Table API执行过程
+
+table api来提交任务的话，也会经过calcite优化等阶段，基本流程和直接运行sql类似:
+
+```mermaid
+
+graph TB
+table_api_parse[1.Table API parse] --> sql_validate[2.Sql Validator] 
+sql_validate -->create_logical_plan[3.生成Logical Plan]
+create_logical_plan --> optimize_logical_plan[4.生成优化的Logical Plan]
+optimize_logical_plan --> physical_plan[5.生成Flink Physical Plan]
+physical_plan --> execute_plan[6.生成Execution Plan]
+
+```
+
+1. **table api parser**
+
+   flink会把table api表达的计算逻辑也表示成一颗树，用treeNode去表式; 在这棵树上的每个节点的计算逻辑用Expression来表示。
+
+2. **Validate**
+
+    结合数字字典(catalog)将树的每个节点的Unresolved Expression进行绑定，生成Resolved Expression；
+
+3. **生成Logical Plan**
+
+   依次遍历数的每个节点，调用construct方法将原先用treeNode表达的节点转成成用calcite 内部的数据结构relNode 来表达。即生成了LogicalPlan, 用relNode表示;
+
+4. **生成 optimized LogicalPlan**
+
+   先基于calcite rules 去优化logical Plan, 再基于flink定制的一些优化rules去优化logical Plan；
+
+5. **生成Flink PhysicalPlan**
+
+   这里也是基于flink里头的rules将，将optimized LogicalPlan转成成Flink的物理执行计划；
+
+6. **将物理执行计划转成Flink ExecutionPlan**
+
+   调用相应的tanslateToPlan方法转换和利用CodeGen元编程成Flink的各种算子。
+
+所以在flink提供两种API进行关系型查询，Table API 和 SQL。这两种API的查询都会用包含注册过的Table的catalog进行验证，除了在开始阶段从计算逻辑转成logical plan有点差别以外，之后都差不多。同时在stream和batch的查询看起来也是完全一样。只不过flink会根据数据源的性质(流式和静态)使用不同的规则进行优化, 最终优化后的plan转传成常规的Flink DataSet 或 DataStream 程序。所以我们下面统一用table api来举例讲解flink是如何用calcite做解析优化，再转换成回DataStream。
 
 
 
@@ -5820,10 +6177,12 @@ Flink的Planner两个作用：
 动态表有3中类型：
 
 - 只有更新行为，只有一行或多行但被持续更新的表；
+
 - 只有插入行为，没有`UPDATE、DELETE`更改的**只插入表**。
+
 - 既有插入行为也有更新行为的表。
 
- 
+  
 
 当将动态表转化为流或将其写入外部系统，对动态表的更改(修改)需要被转换为流上的行为，`Flink`的`Table API & SQL`支持3种方式动态表上的更改(修改)。
 
@@ -5879,13 +6238,138 @@ Flink对解析部分的改进
 
 ### 从SqlNode树到RelNode树
 
+
+
 如何识别对应的SqlNode转换为RelNode
 
 从CalciteRelNode到FlinkRelNode，以及为什么要这么做？
 
+#### Flink中的FlinkLogicalRel（flink）
+
+在Calcite中解析生成的RelNode在转换成Flink的物理计划前，都要经过一次转换为Flink定义的Flink RelNode。
+
+Flink RelNode与Calcite的RelNode几乎是一一对应的。Flink中的RelNode类使用Scala编写，所有带有`FlinkLogicalRel`特质的类都是Flink中的RelNode，命名为`FlinkLogicalXXX`，位于包`org.apache.flink.table.plan.nodes.logical`中。
+
+Flink RelNode与Calcite RelNode的对应关系如下：
+
+| Flink RelNode                    | Calcite RelNode             | 说明                                                         |
+| -------------------------------- | --------------------------- | ------------------------------------------------------------ |
+| FlinkLogicalAggregate            | LogicalAggregate            |                                                              |
+| FlinkLogicalCalc                 | LogicalCalc                 |                                                              |
+| FlinkLogicalCorrelate            | LogicalCorrelate            |                                                              |
+| FlinkLogicalDataSetScan          | TableScan                   | FlinkLogicalDataSetScan跟Calcite中没有直接对应的<br />RelNode，所以其转换不是使用Calcite规则，而是<br />使用QueryOperationConverter进行转换。 |
+| FlinkLogicalDataStreamScan       | TableScan                   | FlinkLogicalDataStreamScan跟Calcite中没有直接对应的<br />RelNode，所以其转换不是使用Calcite规则，而是<br />使用QueryOperationConverter进行转换。 |
+| FlinkLogicalIntersect            | LogicalIntersect            |                                                              |
+| FlinkLogicalJoin                 | LogicalJoin                 |                                                              |
+| FlinkLogicalMatch                | LogicalMatch                |                                                              |
+| FlinkLogicalMinus                | LogicalMinus                |                                                              |
+| FlinkLogicalOverWindow           | LogicalWindow               |                                                              |
+| FlinkLogicalSort                 | LogicalSort                 |                                                              |
+| FlinkLogicalTableAggregate       | LogicalTableAggregate       |                                                              |
+| FlinkLogicalTableFunctionScan    | LogicalTableFunctionScan    |                                                              |
+| FlinkLogicalTableSourceScan      | TableScan                   |                                                              |
+| FlinkLogicalTemporalTableJoin    | LogicalTemporalTableJoin    |                                                              |
+| FlinkLogicalUnion                | LogicalUnion                |                                                              |
+| FlinkLogicalValues               | LogicalValues               |                                                              |
+| FlinkLogicalWindowAggregate      | LogicalWindowAggregate      |                                                              |
+| FlinkLogicalWindowTableAggregate | LogicalWindowTableAggregate |                                                              |
+
+
+
+#### Flink中的LogicalRel（blink）
+
+Flink RelNode与Calcite RelNode的对应关系如下：
+
+| Flink RelNode                    | Calcite RelNode                 | 说明               |
+| -------------------------------- | ----------------------------------- | ------------------ |
+| FlinkLogicalAggregate            | LogicalAggregate            |                    |
+| FlinkLogicalCalc                 | LogicalCalc                      |                    |
+| FlinkLogicalCorrelate            | LogicalCorrelate                 |                    |
+| FlinkLogicalDataStreamTableScan  | LogicalTableScan                      |                    |
+| FlinkLogicalExpand  			| LogicalExpand                      |                    |
+| FlinkLogicalIntermediateTableScan  | TableScan                      |      包装了flink `IntermediateRelTable`              |
+| FlinkLogicalIntersect            | LogicalIntersect                                  |                    |
+| FlinkLogicalJoin                 | LogicalJoin                  |                    |
+| FlinkLogicalMatch                | LogicalMatch                     |                    |
+| FlinkLogicalMinus                | LogicalMinus                  |                    |
+| FlinkLogicalOverAggregate         | LogicalWindow             |                    |
+| FlinkLogicalRank                 | LogicalRank                      |                    |
+| FlinkLogicalSink                | LogicalSink                      |                    |
+| FlinkLogicalSnapshot               | LogicalSnapshot                      |                    |
+| FlinkLogicalSort                 | LogicalSort                  |                    |
+| FlinkLogicalTableFunctionScan    |  LogicalTableFunctionScan   |                    |
+| FlinkLogicalTableSourceScan      | LogicalTableScan               |                    |
+| FlinkLogicalUnion                | LogicalUnion                     |                    |
+| FlinkLogicalValues               | LogicalValues                    |                    |
+| FlinkLogicalWatermarkAssigner      | LogicalWatermarkAssigner      |                    |
+| FlinkLogicalWindowAggregate      | LogicalWindowAggregate      |                    |
+
+
+### 从Flink逻辑计划到Flink物理计划
+
+#### 流对应关系（flink）
+
+| Flink RelNode                    | Flink DataStreamRel                 | 说明               |
+| -------------------------------- | ----------------------------------- | ------------------ |
+| FlinkLogicalAggregate            | DataStreamGroupAggregate            |                    |
+| FlinkLogicalCalc                 | DataStreamCalc                      |                    |
+| FlinkLogicalCorrelate            | DataStreamCorrelate                 |                    |
+| FlinkLogicalDataSetScan          | 无                                  | 此relnode是batch的 |
+| FlinkLogicalDataStreamScan       | DataStreamScan                      |                    |
+| FlinkLogicalIntersect            | 无                                  |                    |
+| FlinkLogicalJoin                 | DataStreamJoin                      |                    |
+| FlinkLogicalMatch                | DataStreamMatch                     |                    |
+| FlinkLogicalMinus                | 无                                  |                    |
+| FlinkLogicalOverWindow           | DataStreamOverAggregate             |                    |
+| FlinkLogicalSort                 | DataStreamSort                      |                    |
+| FlinkLogicalTableAggregate       | DataStreamGroupTableAggregate       |                    |
+| FlinkLogicalTableFunctionScan    | DataStreamCorrelate的一部分         |                    |
+| FlinkLogicalTableSourceScan      | StreamTableSourceScan               |                    |
+| FlinkLogicalTemporalTableJoin    | DataStreamTemporalTableJoin         |                    |
+| FlinkLogicalUnion                | DataStreamUnion                     |                    |
+| FlinkLogicalValues               | DataStreamValues                    |                    |
+| FlinkLogicalWindowAggregate      | DataStreamGroupWindowAggregate      |                    |
+| FlinkLogicalWindowTableAggregate | DataStreamGroupWindowTableAggregate |                    |
+
+#### 流对应关系（blink）
+| Flink RelNode                    | Flink StreamPhysicalRel                 | 说明               |
+| -------------------------------- | ----------------------------------- | ------------------ |
+| FlinkLogicalAggregate            | StreamExecGroupAggregate            |                    |
+| FlinkLogicalCalc                 | StreamExecCalc                      |                    |
+| FlinkLogicalCorrelate            | StreamExecCorrelate                 |                    |
+| FlinkLogicalDataStreamTableScan  | StreamExecDataStreamScan                      |                    |
+| FlinkLogicalExpand  			| StreamExecExpand                      |                    |
+| FlinkLogicalIntermediateTableScan  | StreamExecIntermediateTableScan                      |                    |
+| FlinkLogicalIntersect            | 无                                  |                    |
+| FlinkLogicalJoin                 | StreamExecJoin、StreamExecLookupJoin、StreamExecTemporalJoin、StreamExecWindowJoin                  |                    |
+| FlinkLogicalMatch                | StreamExecMatch                     |                    |
+| FlinkLogicalMinus                | 无                                  |                    |
+| FlinkLogicalOverAggregate         | StreamExecOverAggregate             |                    |
+| FlinkLogicalRank                 | StreamExecRank或StreamExecDeduplicate                      |                    |
+| FlinkLogicalSink                | StreamExecSink                      |                    |
+| FlinkLogicalSnapshot               | 待研究 |                    |
+| FlinkLogicalSort                 | StreamExecSort、StreamExecSortLimit、StreamExecLimit或StreamExecTemporalSort                  |                    |
+| FlinkLogicalTableFunctionScan    |          |                    |
+| FlinkLogicalTableSourceScan      | StreamExecTableSourceScan、StreamTableSourceScan               |                    |
+| FlinkLogicalUnion                | StreamExecUnion                     |                    |
+| FlinkLogicalValues               | StreamExecValues                    |                    |
+| FlinkLogicalWatermarkAssigner      | StreamExecWatermarkAssigner      |                    |
+| FlinkLogicalWindowAggregate      | StreamExecGroupWindowAggregate      |                    |
+
+**优化**
+StreamExecGroupAggregate可能会被优化为StreamExecGlobalGroupAggregate
+
+### 从Flink物理计划到Flink Transformation
+
+#### FlinkPhysicalRel到 Flink PhysicalTransformation
+
+
+
 ## SQL优化（待完善）
 
 Flink使用Calcite的Optimizer作为SQL优化器。
+
+### Calcite内置的优化规则（待编写）
 
 ### Stream优化
 
@@ -8326,9 +8810,9 @@ Flink支持四种类型的自定义函数：
 
 
 
-## 自定义Source&Sink
+## Source&Sink
 
-
+![img](images/5501600-44a32abb18a76d04.webp)
 
 # Flink ML（待编写）
 
