@@ -1,4 +1,4 @@
-**<font size=20 textAlign ="center">Deep In Flink</font>**
+**<font size=20 textAlign ="center">``Deep In Flink</font>**
 
 [TOC]
 
@@ -342,6 +342,22 @@ public static String readString(DataInput in) throws IOException {
 
 ​		推荐使用 org.apache.flink.api.java.typeutils.runtime.kryo.JavaSerializer 而非 com.esotericsoftware.kryo.serializers.JavaSerializer 以防止与 Flink 不兼容。
 
+## Flink Table模块的逻辑类型
+
+![1563584477847](images/1563584477847.png)
+
+Flink Table模块之中额外定义了`LogicalType`（类型），`LogicalType`是所有具体类型的抽象父类，其子类如上图所示，包含预定义类型和用户自定义类型两大类。
+
+`LogicalType`与SQL类型基本一致，但是增加了一些额外的信息，例如是否可以为null等，目的是提高scala expression（标量表达式）的处理效率。
+
+`LogicalType`子类，定义了每种类型的特殊的参数，例如对于数值类型，定义其长度和精度。
+
+> `LogicalType`类型只是用来描述数据类型的，当前planner和runtime尚未支持所有的`LogicalType`类型。
+
+### LogicalType与原有类型系统的对应关系
+
+
+
 # Flink中常见的数据流的类型
 
 ## 数据流（DataStream）是什么
@@ -434,6 +450,70 @@ val result: DataStream[ResultType] =
 当并行度为2时，其执行图如下所示：
 
 ![img](./images/datastream-connect-example.png)
+
+## 数据流元素的类型
+
+![1563856676898](images/1563856676898.png)
+
+`StreamElement`是Flink中数据流的单个元素的抽象，包含了4中类型的`StreamElement`，如下。
+
+
+
+**StreamRecord**
+
+`StreamRecord`表示数据流中的一条记录（或者叫做一个事件），包含如下内容：
+
+- 数据的值本身
+- 事件戳（可选）
+
+**LatencyMarker**
+
+特殊的类型StreamRecord，携带如下信息：
+
+- ​	携带一个从source被创造出来的时间戳
+- ​	vertexId
+- ​	source operator的subtask index.
+
+在sink中，使用LatencyMarker可以估计数据在整个DAG图中流转花费的时间，用来近似的评估延时。
+
+**Watermark**
+
+Watermark是一个时间戳，用来告诉Operator，所有时间 <= Watermark的事件或记录都已经处理完毕，不会再有比Watermark更早的记录，Operator可以根据watermark 触发window的计算、清理资源等等。后边有详细介绍。
+
+**StreamStatus**
+
+`StreamStatus`可以表示两种状态：
+
+- **IDLE**
+- **ACTIVE**
+
+用来告诉Stream Task是否会继续接收到上游的记录或者Watermark。`StreamStatus`在Source Operator中生成，向下游沿着DAG传播。
+
+当`SourceStreamTask`或一般的`StreamTask`处于闲置状态（IDLE），不会向下游发送数据或者Watermark的时候，就向下游发送`StreamStatus#IDLE`状态告知下游，依次向下传递。当恢复向下游发送数据或者WaterMark前，首先发送`StreamStatus#ACTIVE`状态告知下游。
+
+
+
+**如何判断是Idle还是Active状态？**
+
+- 对于Source Task，如果读取不到输入数据，则认为是Idle状态，例如，Kafka Consumer未被赋予partition。如果重新读取到数据了，则认为是Active状态。
+- 当StreamTask的所有SourceTask **全部** 处于**Idle**状态的时候认为这个StreamTask处于IDEL状态，只要有一个上游的Source Task是**Active**状态，StreamTask就是**Active**状态。
+
+**Stream Status如何影响Watermark？**
+
+由于SourceTask保证在**Idle**状态和**Active**状态之间不会发生数据元素，所以StreamTask可以在不需要检查当前的状态的情况下安全的处理和传播收到数据元素。但是由于在DAG的任何中间节点都可能产生watermark，所以当前StreamTask在发送watermark之前必须检查当前Operator的状态,如果当前的状态是**Idle**,则watermark会被阻塞，不会向下游发送。
+
+如果StreamTask有多个上游输入，有两种情况：
+
+- 上游输入的Watermark状态为Idle
+- 恢复到Active状态，但是其Watermark落后于当前Operator的最小Watermark，此时需要忽略这一个特殊的Watermark。在判断是否需要向前推进Watermark和向下游发送的时候，这个特殊Watermark不起作用。
+
+> **注意**
+>
+> 当Source通知下游SourceTask永久关闭，并且再也不会向下游发送数据的时候，会发送一个的值为`Watermark.MAX_WATERMARK`的watermark而不是一个`StreamStatus#IDLE`状态。
+>
+> `StreamStatus`只是用作临时性的停止数据发送和恢复发送的情况。
+
+
 
 # Flink中的时间
 
@@ -2264,15 +2344,159 @@ private void addEdgeInternal(Integer upStreamVertexID, Integer downStreamVertexI
 
 #### 关键对象
 
-**StreamTransformation**
+##### **Transformation**
+
+`Transformation`是`StreamTransformation`重命名而来。
+
+并不是每一个 Transformation 都会转换成runtime层中的物理操作。有一些只是逻辑概念，比如union、split/select、partition等。
+
+如下图所示的Transformation Graph，经过转换之后逻辑运算被简化：
+
+- **转换前的Transformation Graph**
+
+  
+
+```java
+                                       Source              Source
+                                          +                   +
+                                          |                   |
+                                          v                   v
+                                      Rebalance          HashPartition
+                                          +                   +
+                                          |                   |
+                                          |                   |
+                                          +------>Union<------+
+                                                    +
+                                                    |
+                                                    v
+                                                  Split
+                                                    +
+                                                    |
+                                                    v
+                                                  Select
+                                                    +
+                                                    v
+                                                   Map
+                                                    +
+                                                    |
+                                                    v
+                                                  Sink
+```
 
 
 
-**StreamOperator**
+- **转换后的实际执行Graph**
+
+  
+
+```java
+                                          Source              Source
+                                            +                   +
+                                            |                   |
+                                            |                   |
+                                            +------->Map<-------+
+                                                      +
+                                                      |
+                                                      v
+                                                     Sink
+```
+
+##### **StreamOperator**（待继续编写）
+
+**Stream Operator总体继承关系**
+
+![1563847919329](images/1563847919329.png)
+
+> 上图放大看
+>
+
+**StreamOperator**是Operator的顶层接口，其包含了2个子接口和3个抽象类
+
+**2个子接口**
+
+- `org.apache.flink.streaming.api.operators.OneInputStreamOperator`
+
+  定义了单流输入的处理接口
+
+  ```java
+  @PublicEvolving
+  public interface OneInputStreamOperator<IN, OUT> extends StreamOperator<OUT> {
+  
+  	/**
+  	 * 处理输入数据流
+	     * 此方法必须保证不会被被该Operator的其他方法并发调用  	 
+	    */
+  	void processElement(StreamRecord<IN> element) throws Exception;
+  
+  	/**
+  	 * 处理Watermark
+  	 * 此方法必须保证不会被被该Operator的其他方法并发调用
+  	 */
+  	void processWatermark(Watermark mark) throws Exception;
+  	
+    //处理LatencyMarker
+  	void processLatencyMarker(LatencyMarker latencyMarker) throws Exception;
+  }
+  ```
+
+  
+
+- `org.apache.flink.streaming.api.operators.TwoInputStreamOperator`
+
+  定义了双流输入的处理接口
+
+  ```java
+  @PublicEvolving
+  public interface TwoInputStreamOperator<IN1, IN2, OUT> extends StreamOperator<OUT> {
+  
+  	//处理第一个输入流的数据
+  	void processElement1(StreamRecord<IN1> element) throws Exception;
+  
+  	//处理第二个输入流的数据
+  	void processElement2(StreamRecord<IN2> element) throws Exception;
+  
+  	//处理第一个输入的watermark
+  	void processWatermark1(Watermark mark) throws Exception;
+  
+  	//处理第二个input输入的watermark
+  	void processWatermark2(Watermark mark) throws Exception;
+  
+  	//处理第一个输入的LatencyMarker
+  	void processLatencyMarker1(LatencyMarker latencyMarker) throws Exception;
+  
+  	//处理第二个输入的LatencyMarker
+  	void processLatencyMarker2(LatencyMarker latencyMarker) throws Exception;
+  
+  }
+  ```
+
+  
+
+> 所有的Operator都实现了两个接口之一，Flink中Operator没有多流输入的处理接口。
+
+**3个抽象类**
+
+![1563849675998](images/1563849675998.png)
+
+如上图所示的继承关系
+
+- `AbstractStreamOperator`
+
+  所有Stream Operator的基类，提供了Operator声明周期、Checkpoint的保存和恢复。
+
+- `AbstractUdfStreamOperator`
+
+  `AbstractUdfStreamOperator`用来支持可以编写用户自定义函数类型的Operator，相对`AbstractStreamOperator`而言，提供了对UDF的生命周期的管理。
+
+- `TableStreamOperator`
+
+  flink-table-planner-blink中增加的`StreamOperator`类型，用来支持将TableAPI和SQL的调用转换成`TableStreamOperator`执行。详情参见**Flink Table & SQL**章节。
+
+（待编写）
 
 
 
-#### DataStream API到 StreamTransformation
+#### DataStream API到 Transformation
 
 ```java
 //DataStream.java
@@ -2300,7 +2524,7 @@ public <R> SingleOutputStreamOperator<R> transform(String operatorName, TypeInfo
 			environment.getParallelism());
     //封装成StreamOperator
 	@SuppressWarnings({ "unchecked", "rawtypes" })
-	SingleOutputStreamOperator<R> returnStream = new 	                        SingleOutputStreamOperator(environment, resultTransform);
+	SingleOutputStreamOperator<R> returnStream = new 	                        	       SingleOutputStreamOperator(environment, resultTransform);
     //注册到StreamExectionEnvirment中，后边生成StreamGraph会用到
 	getExecutionEnvironment().addOperator(resultTransform);
 
@@ -2318,13 +2542,13 @@ public <R> SingleOutputStreamOperator<R> transform(String operatorName, TypeInfo
 
 StreamInputProcessor.processInput()从InputGate读取数据，然后调用StreamOperator.processElement处理数据。
 
-#### StreamFormation、StreamOperator、UDF的关系
+#### StreamTransformation、StreamOperator、UDF的关系
 
 ![1560329270219](/images/1560329270219.png)
 
 #### 实体StreamNode和虚拟StreamNode
 
-并不是每一个 StreamTransformation 都会转换成runtime层中的物理操作。有一些只是逻辑概念，比如union、split/select、partition等。
+并不是每一个 Transformation 都会转换成runtime层中的物理操作。有一些只是逻辑概念，比如union、split/select、partition等。
 
 虚拟的StreamNode不会变成实体的StreamNode，实体的StreamNode往往表达是用户实现的逻辑，此处的功能是不确定的，因业务而异，很可能会生成不同结构的StreamRecord的输出交给下游。而Split、union、partition这些逻辑是很明确的，不会改变StreamRecord，在执行的时候封装到StreamEdge。
 
@@ -5763,6 +5987,14 @@ Connector、Formats和UDF可以依赖于此模块，无需依赖整个的Table A
 
 ## 关键对象
 
+### Executor
+
+**类继承关系**
+
+![1563683393377](images/1563683393377.png)
+
+`Executor`是Flink执行的最上层抽象接口，用来解耦`TableEnvirment`·和具体的runtime。
+
 ### Expression
 
 所有表达式的顶层接口，用来表示尚未经过解析的表达式，解析、验证之后成为ResolvedExpression。
@@ -5797,7 +6029,7 @@ PlannerExpression是有三个子类，表示三类运算：
 
 ### ResolvedExpression
 
-ResolvedExpression与Expression相比，不包含为解析的子表达式，并且添加了数据的输出类型。
+ResolvedExpression与Expression相比，不包含未解析的子表达式，并且添加了数据的输出类型。
 
 ResolvedExpression包含了如下实现：
 
@@ -5805,7 +6037,7 @@ ResolvedExpression包含了如下实现：
 
 **CallExpression**
 
-CallExpression**表示一个解析、验证后的函数调用表达式。其基本属性如下：
+`CallExpression`表示一个解析、验证后的函数调用表达式。其基本属性如下：
 
 <ul>
 	<li>输出类型</li>
@@ -5863,7 +6095,17 @@ private final int inputIndex;
 private final int fieldIndex;
 ```
 
+### ExpressionResolver
 
+`ExpressionResolver`在Table API中使用，将Table API中的原始的Expression表达式（未解析）解析成ResolvedExpression。解析的内容包括一般的表达式和函数调用（`BuiltInFunctionDefinitions#OVER`）
+
+`ExpressionResolver`内置了一组解析规则，解析行为如下：
+
+1. 展平`*`号，并解析函数中的列名对下层输入列的引用；
+2. 将Over聚合和Over Window合并到一个函数调用；
+3. 解析所有未经解析的引用，这些引用可能是对字段、表或者是`本地引用`(LocalReferenceExpression参见上节）；
+4. 替换函数调用，例如`BuiltInFunctionDefinitions#FLATTEN`，`BuiltInFunctionDefinitions#WITH_COLUMNS`；
+5. 执行所有函数调用的入参类型校验，如果有必要则进行类型转换。
 
 <font color=red>待分析。</font>
 
@@ -6228,7 +6470,7 @@ Flink的Planner两个作用：
 
   ![img](images/redo-mode.png)
 
-## SQL解析（待编写）
+## SQL到执行
 
 ### 从Sql语句到SqlNode树
 
@@ -6361,7 +6603,171 @@ StreamExecGroupAggregate可能会被优化为StreamExecGlobalGroupAggregate
 
 ### 从Flink物理计划到Flink Transformation
 
-#### FlinkPhysicalRel到 Flink PhysicalTransformation
+在blink融合到flink之后，flink在table api& SQL中引入了更大规模的代码生成，从Flink的PhysicalRel直接生成Transformation。然后走图生成的流程。
+
+
+
+
+
+## Table  API到执行（blink）
+
+
+
+![1563538572357](images/1563538572357.png)
+
+
+
+在TableAPI上调用select、group by 、filter等api的时候，其实质上是调用`OperationTreeBuilder`创建了一棵`QueryOperation`树，`OperationTreeBuilder`对输入的参数，如字段、函数、表达式等进行解析校验，确保创建的`QueryOperation`都是合法的。
+
+将对API的调用封装为`QueryOperation`对象。
+
+然后使用`QueryOperationConverter`将`QueryOperation`转换为Calcite RelNode逻辑节点树。转换为RelNode树之后，TableAPI和SQL调用统一了。
+
+### Table的关键属性
+
+```java
+@Internal
+public class TableImpl implements Table {
+    //全局唯一标识符
+	private static final AtomicInteger uniqueId = new AtomicInteger(0);
+    
+	private final TableEnvironment tableEnvironment;
+    //QueryOperatrion树，QueryOperation本身就是一个树形结构
+	private final QueryOperation operationTree;
+    //QueryOperationBuilder，用来创建各种不同类型的QueryOperation
+	private final OperationTreeBuilder operationTreeBuilder;
+    //函数调用解析，使用FunctionCatalog，从函数名解析成实际的函数定义
+	private final LookupCallResolver lookupResolver;
+	//Table名
+	private String tableName = null;
+    ......
+}
+```
+
+
+
+### 从TableAPI到RelNode
+
+#### 从TableAPI到QueryOperation
+
+以`TableImpl.filter`为例
+
+**Filter调用入口**
+
+```java
+@Internal
+public class TableImpl implements Table {
+	//接收字符串形式的filter表达式
+	@Override
+	public Table filter(String predicate) {
+		return filter(ExpressionParser.parseExpression(predicate));
+	}
+	//接收Expression表示的filter表达式
+	@Override
+	public Table filter(Expression predicate) {
+        //首先解析表达式
+		Expression resolvedCallPredicate = predicate.accept(lookupResolver);
+        //将filter转换为FilterOperation，返回一个新的Table带有新的QueryOperation树
+		return createTable(operationTreeBuilder.filter(resolvedCallPredicate, operationTree));
+	}
+}
+
+```
+
+**将Filter添加到QueryOperation树**
+
+```java
+public QueryOperation filter(Expression condition, QueryOperation child) {
+		//获取表达式解析器
+		ExpressionResolver resolver = getResolver(child);
+    	//将未解析的表达式转换成解析后的表达式
+		ResolvedExpression resolvedExpression = resolveSingleExpression(condition, resolver);
+    	//获取解析后表达式的输出类型
+		DataType conditionType = resolvedExpression.getOutputDataType();
+    	//校验表达式的类型是否为boolean类型，filter表达式的输出类型必须为boolean，
+        //同理，其他类型的QueryOperation需要各自不同的校验条件
+		if (!LogicalTypeChecks.hasRoot(conditionType.getLogicalType(), LogicalTypeRoot.BOOLEAN)) {
+			throw new ValidationException("Filter operator requires a boolean expression as input," +
+				" but $condition is of type " + conditionType);
+		}
+		//返回一个经过校验的合法的FilterQueryOperation
+		return new FilterQueryOperation(resolvedExpression, child);
+	}
+```
+
+#### 从QueryOperation到StreamTransformation
+
+**Planner继承关系**
+
+![1563675609567](images/1563675609567.png)
+
+`PlannerBase`继承`Planner`接口，用来兼容flink旧版本遗留的Planner，只能处理流的Plan，不能处理Batch的plan。
+
+`StreamPlanner`和`BatchPlanner`分别继承了`PlannerBase`。
+
+**Planner接口**
+
+Planner接口主要有两个作用：
+
+- **SQL解析**
+
+  将Sql语句解析成与Table API中使用的Operation类似的树形数据结构。
+
+- **关系代数规划**
+
+  提供了优化和将ModifyOperation转换为可执行的`Transformation`的能力。
+
+
+
+**转换过程**
+
+**首先QueryOperation** -> **ModifyOperation** -> **RelNode** -> **FlinkPhysicalRel** -> **ExecNode** ->**Transformation**
+
+代码如下：
+
+```java
+//TableEnvironmentImpl
+@Internal
+public class TableEnvironmentImpl implements TableEnvironment {
+    //从ModifyOperation到Transformation的触发入口
+	private void translate(List<ModifyOperation> modifyOperations) {
+  		//将ModifyOperation为可执行的
+		List<Transformation<?>> transformations = planner.translate(modifyOperations);
+		//将转换后的TransformationExecutor，在执行器上调用Executor#execute触发真正的执行
+		execEnv.apply(transformations);
+	}
+}
+```
+
+
+
+```scala
+//PlannerBase
+abstract class PlannerBase(
+	    executor: Executor,
+	    config: TableConfig,
+	    val functionCatalog: FunctionCatalog,
+	    catalogManager: CatalogManager,
+	    isStreamingMode: Boolean)
+	extends Planner {
+    //该方法是Planner的核心过程
+	override def translate(
+	    modifyOperations: util.List[ModifyOperation]): util.List[Transformation[_]] = {
+		if (modifyOperations.isEmpty) {
+			return List.empty[Transformation[_]]
+		}
+		mergeParameters()
+        //将ModifyOperation转换为RelNode逻辑计划
+		val relNodes = modifyOperations.map(translateToRel)
+        //优化RelNode逻辑计划
+		val optimizedRelNodes = optimize(relNodes)
+        //将RelNode逻辑计划转换为为例计划,从FlinkPhysicalRel DAG 到 ExecNode DAG
+		val execNodes = translateToExecNodePlan(optimizedRelNodes)
+        //将ExecNode DAG转换为StreamTransformation DAG（即Operator DAG）
+		translateToPlan(execNodes)
+	}
+}
+```
 
 
 
@@ -8686,8 +9092,6 @@ val JOIN_REORDER_RULES: RuleSet = RuleSets.ofList(
 
 
 ## 生成执行计划
-
-### 从RelNode树到Operator
 
 
 
