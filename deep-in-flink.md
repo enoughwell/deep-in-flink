@@ -121,6 +121,1684 @@ Flink首先将DataStream API的调用转换为StreamGraph和JobGraph，将JobGra
 
 Flink集群收到客户端提交的JobGraph，将JobGraph转换为ExecutionGraph，根据并行度，创建ExecutionGraph中的执行单元，最终调度到TaskManager真正的执行。
 
+# Flink安装
+
+Flink 支持多种集群部署
+
+- Local模式
+- Standalone独立模式
+- Flink on YARN模式
+- Flink on Mesos模式
+- Flink on K8s模式
+- 等等……
+
+## 准备工作
+
+**Java版本**
+
+确认JDK版本为1.8及以上
+
+JVM版本检查
+
+```shell
+java -version 或者echo $JAVA_HOME
+```
+
+Java编译器版本
+
+```shell
+javac -version
+```
+
+**下载Flink压缩包**
+
+下载地址：http://flink.apache.org/downloads.html。
+
+Yarn模式要求Flink对应的Hadoop版本，此处选择flink 1.8.1，hadoop 2.7.5，如果官方没有对应的Hadoop版本的Flink安装包，可以参考官方的手册，从源码编译。
+
+> 选择scala 2.11版本即可。
+
+**解压压缩包**
+
+Linux: tar -zxvf  flink-1.8.1-bin-scala_2.11.tgz
+
+> Yarn模式使用Linux的部署方式，不建议使用Windows。
+
+**解压压缩包到指定目录**
+
+Linux：
+
+```shell
+tar -zxvf  flink-1.8.1-bin-scala_2.11.tgz
+```
+
+Windows：
+
+使用**WinRar**之类的工具解压即可。
+
+## 部署模式
+
+### 单机部署
+
+单机部署，不需要额外的操作，解压缩完毕之后，启动即可。
+
+**启动集群**
+
+Linux
+
+```shell
+./bin/start-cluster.sh
+```
+
+Windows
+
+```shell
+./bin/start-cluster.bat
+```
+
+> Windows下推荐使用PowerShell，使用图形化界面双击bin目录下的start-cluster.bat，同样也可以启动Flink 本地集群。
+
+启动集群完毕之后，可以进入Flink自带的Web UI界面
+
+http://localhost:8081
+
+**停止集群**
+
+Linux：
+
+```shell
+./bin/stop-cluster.sh
+```
+
+Windows：
+
+```bash
+./bin/stop-cluster.bat
+```
+
+https://ci.apache.org/projects/flink/flink-docs-release-1.8/ops/deployment/cluster_setup.html)
+
+### Yarn模式
+
+Flink on YARN 支持两种模式
+
+- **会话模式（Session Mode）**
+
+  在 YARN 上运行长期运行的 Flink 集群，多个Job可以提交到一个集群中；
+
+  会话模式又分为两种模式
+
+  - 客户端模式
+
+    客户端模式下，客户端是Flink集群的一部分，客户端退出，则Flink集群退出，Flink集群申请的资源释放回Yarn集群。
+
+  - 分离式模式
+
+    分离式模式下，客户端启动Flink集群之后，整个Flink集群托管给Yarn集群，客户端退出，Flink集群仍然可以正常的工作。
+
+- **任务模式（Job Mode）**
+
+  在 YARN 上运行 Flink 任务，一个Job对应一个Flink集群，Job之间相互隔离，不会相互影响。
+
+  
+
+**任务模式**
+
+Flink run直接在YARN上提交运行Flink作业(Run a Flink job on YARN)，一个Job启动一个集群。这种方式的好处是一个任务会对应一个job,即没提交一个作业会根据自身的情况，向yarn申请资源，直到作业执行完成，并不会影响下一个作业的正常运行，除非是yarn上面没有任何资源的情况下。
+
+命令示例如下：
+
+```shell
+./bin/flink run -m yarn-cluster -p 4 -yjm 1024m -ytm 4096m ./examples/batch/WordCount.jar
+```
+
+
+
+**会话模式**
+
+Yarn seesion(Start a long-running Flink cluster on YARN)方式，需要先启动集群，然后在提交作业，接着会向yarn申请一块空间后，不能超过yarn队列的上限。如果资源满了，下一个作业就无法提交，只能等到yarn中的其中一个作业执行完成后，释放了资源，那下一个作业才会正常提交。
+
+Yarn Session的启动参数可以通过如下方式查看**
+
+```shell
+./bin/yarn-session.sh –help
+```
+
+yarn-session的参数说明
+
+```shell
+ 必选参数：
+ 	-n,--container <arg> 				:指定yarn container的数量；
+ 可选参数：
+ 	-D <property=value>             	:指定属性值;
+  	-d,--detached						:以分离模式运行;
+  	-h,--help							:帮助;
+  	-id,--applicationId <arg>			:指定yarn的任务ID；
+  	-j,--jar <arg>						:Flink jar文件的路径;
+  	-jm,--jobManagerMemory <arg>		:JobManager容器的内存（默认值：MB）;
+  	-m,--jobmanager <arg>				:指定JobManager的连接地址端口，用来连接配置文件中未指定的JobManager;
+  	-nl,--nodeLabel <arg>				:为YARN应用程序指定YARN节点标签;
+  	-nm,--name <arg>					:在YARN上为应用程序设置自定义名称;
+  	-q,--query 							:显示可用的YARN资源(内存，内核);
+  	-qu,--queue <arg> 					:指定YARN队列;
+  	-s,--slots <arg>					:指定TaskManager中slot的数量;
+  	-sae,--shutdownOnAttachedExit		:如果以任务模式提交Job，当CLI窗口关闭的时候，尽量优雅的结束集群，例如当用户
+  										 Ctrl + C的时候							
+  	-st,--streaming						:以流模式启动Flink;(已废弃)
+  	-t,--ship <arg>						:跳过指定目录中的文件;
+  	-tm,--taskManagerMemory <arg>		:每个TaskManager容器的内存（默认值：MB）;
+  	-yd,--yarndetached 					:已废弃
+  	-z,--zookeeperNamespace <arg> 		:命名空间，用于为高可用性模式创建Zookeeper子路径;
+```
+
+1. **客户端模式（默认）**
+
+   **启动Flink集群**
+
+   ```
+   ./bin/yarn-session.sh -n 2 -jm 1024 -tm 1024
+   ```
+
+   对于客户端模式，可以启动多个yarn session，一个yarn session模式对应一个JobManager，并按照需求提交作业，同一个Session中可以提交多个Flink作业。
+
+   **提交Job**
+
+   ```shell
+   ./bin/flink run ./examples/streaming/WordCount.jar --input hdfs:\\... --output hdfs:\\...
+   ```
+
+   **停止Flink集群**
+
+   如果想要停止Flink Yarn Application，需要通过yarn application -kill命令来停止、关闭CLI窗口、Ctrl+C或者进入yarn的管理界面cancle flink会话。
+
+2. **分离式模式（detach）**
+
+   对于分离式模式，并不像客户端那样可以启动多个yarn session，如果启动多个，会出现下面的session一直处在等待状态。JobManager的个数只能是一个，同一个Session中可以提交多个Flink作业。
+
+   通过-d指定分离模式，即客户端在启动Flink Yarn Session后，就不再属于Yarn Cluster的一部分，可以安全的关闭CLI。
+
+   ```shell
+   ./bin/yarn-session.sh -d -n 2 -jm 1024 -tm 1024 
+   ```
+
+   yarn-session启动的时候可以指定-nm的参数，给yarn-session设置一个对人而言比较友好的名字（默认的名字是一大长串字符串）。例如：
+
+   ```shell
+   ./bin/yarn-session.sh -nm cm_sql_stream
+   ```
+
+   **提交Job**
+
+   ```shell
+   ./bin/flink run ./examples/streaming/WordCount.jar --input hdfs:\\... --output hdfs:\\...
+   ```
+
+   **停止Flink集群**
+
+   如果想要停止Flink Yarn Application，需要通过yarn application -kill命令来停止。或者进入yarn的管理界面cancle flink会话。
+
+### K8s模式
+
+首先需要安装k8s集群，参照 [Kubernetes’ setup guide](https://kubernetes.io/docs/setup/)，如果只是在本地安装，推荐使用 [MiniKube](https://kubernetes.io/docs/setup/minikube/)。
+
+**K8s Flink Session Cluster**
+
+Flink会话集群，在K8s上是一个长期执行的部署模式，需要包含如下三类组件：
+
+- 一个JobManager
+- 一组TaskManager
+- K8s Servcie堆外提供Flink 的UI和端口
+
+**创建Flink 集群**
+
+执行如下命令创建Flink集群
+
+```shell
+kubectl create -f jobmanager-service.yaml
+kubectl create -f jobmanager-deployment.yaml
+kubectl create -f taskmanager-deployment.yaml
+```
+
+默认会使用DockHub上flink的最新镜像创建Flink集群。
+
+**访问Web UI**
+
+在CLI中启动k8s代理
+
+```shell
+kubectl proxy
+```
+
+Web UI地址： http://localhost:8081/api/v1/namespaces/default/services/flink-jobmanager:ui/proxy
+
+**提交Job**
+
+```
+./bin/flink run -m  ./examples/streaming/WordCount.jar --input hdfs:\\... --output hdfs:\\...
+```
+
+**附录：k8s配置文件**
+
+**jobmanager-deployment.yaml**
+
+```yaml
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: flink-jobmanager
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: jobmanager
+    spec:
+      containers:
+      - name: jobmanager
+        image: flink:latest
+        args:
+        - jobmanager
+        ports:
+        - containerPort: 6123
+          name: rpc
+        - containerPort: 6124
+          name: blob
+        - containerPort: 6125
+          name: query
+        - containerPort: 8081
+          name: ui
+        env:
+        - name: JOB_MANAGER_RPC_ADDRESS
+          value: flink-jobmanager
+```
+
+
+
+**taskmanager-deployment.yaml**
+
+```yaml
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: flink-taskmanager
+spec:
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: flink
+        component: taskmanager
+    spec:
+      containers:
+      - name: taskmanager
+        image: flink:latest
+        args:
+        - taskmanager
+        ports:
+        - containerPort: 6121
+          name: data
+        - containerPort: 6122
+          name: rpc
+        - containerPort: 6125
+          name: query
+        env:
+        - name: JOB_MANAGER_RPC_ADDRESS
+          value: flink-jobmanage
+```
+
+
+
+**jobmanager-service.yaml**
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: flink-jobmanager
+spec:
+  ports:
+  - name: rpc
+    port: 6123
+  - name: blob
+    port: 6124
+  - name: query
+    port: 6125
+  - name: ui
+    port: 8081
+  selector:
+    app: flink
+    component: jobmanager
+```
+
+### Standalone
+
+使用不多，暂不介绍，参考[《官方文档》](https://ci.apache.org/projects/flink/flink-docs-release-1.8/ops/jobmanager_high_availability.html#standalone-cluster-high-availability)。
+
+## HA高可用
+
+### Yarn HA
+
+运行高可用YARN集群时，实际上**只运行1个JobManager（ApplicationMaster）实例**，JobManager实例在发生故障时，由YARN负责重新启动。确切的行为取决于使用YARN的特定版本。
+
+**配置**
+
+1. **Application Master最大重试次数(yarn-site.xml)**
+
+必须配置YARN集群的yarn-site.xml文件中的Application Master最大重试次数。
+
+```xml
+<property>
+  <name>yarn.resourcemanager.am.max-attempts</name>
+  <value>4</value>
+  <description>
+    The maximum number of application master execution attempts.
+  </description>
+</property>
+```
+
+如上配置，表示容忍3次JobManager失败。
+
+2. **Application Attempts (flink-conf.yaml)**
+
+除了在yarn-site.xml中HA配置项，还必须在fink-conf.yaml文件中配置最大重试次数。
+
+```yaml
+yarn.application-attempts: 10
+```
+
+  这意味着在YARN使应用程序失败之前，应用程序可以重新启动9次以进行失败尝试（9次重试+ 1次初始尝试）。如果YARN操作（抢占，节点硬件故障或重新启动，或NodeManager重新同步）需要，YARN可以执行其他重新启动。这些重启不计入**yarn.application-attempts**。重要的是要注意**yarn.resourcemanager.am.max-attempts**应用程序重新启动的上限。因此，Flink中设置的应用程序尝试次数**不能超过**启动的YARN集群设置。
+
+**容器关闭行为**
+
+- **YARN 2.3.0 < version < 2.4.0.**如果Application Master失败，则重启所有的容器。
+- **YARN 2.4.0 < version < 2.6.0.**TaskManager容器在Application Master故障期间保持活动状态。优点是：启动时间更快并且用户不必等待再次获得容器资源。
+- **YARN 2.6.0 <= version.**将尝试失败**有效性间隔**设置为Flinks的Akka**超时值**。尝试失败有效性间隔表示系统在一个间隔期间看到最大应用程序尝试次数后才会终止应用程序。这避免了持久的作业会耗尽它的应用程序尝试。
+  **注意：**Hadoop YARN 2.4.0有一个主要错误（在2.5.0中修复），阻止重新启动的Application Master / Job Manager容器重启容器。有关详细信息，请参阅[FLINK-4142](https://issues.apache.org/jira/browse/FLINK-4142)。我们建议至少在YARN上使用Hadoop 2.5.0进行高可用性设置。
+
+**示例：高可用的YARN会话**
+
+1. 在文件conf/flink-conf.yaml中配置高可用模式以及zookeeper仲裁集群
+
+   ```yaml
+   high-availability: zookeeper
+   high-availability.zookeeper.quorum: localhost:2181
+   high-availability.zookeeper.path.root: /flink
+   high-availability.storageDir: hdfs:///flink/recovery
+   yarn.application-attempts: 10
+   ```
+
+2. 在文件conf/zoo.cfg中配置Zookeeper服务器(目前只能是在每个机器节点上运行单一的Zookeeper服务)
+
+   ```properties
+   server.0=localhost:2888:3888
+   ```
+
+3. 启动Zookeeper仲裁
+
+   ```shell
+   $ bin/start-zookeeper-quorum.sh
+   Starting zookeeper daemon on host localhost.
+   ```
+
+   4.启动HA集群
+
+   ```shell
+   $ bin/yarn-session.sh -n 2
+   ```
+
+### Standalone HA
+
+使用不多，暂不介绍，参考[《官方文档》](https://ci.apache.org/projects/flink/flink-docs-release-1.8/ops/deployment/cluster_setup.html)。
+
+# Flink流计算开发入门
+
+## 数据流（DataStream）是什么
+
+​		DataStream 是 Flink 流处理 API中最核心的数据结构。它代表了一个运行在多个分区上的并行流。一个 DataStream 可以从 StreamExecutionEnvironment 通过env.addSource(SourceFunction) 获得 。
+
+​		DataStream 上的转换操作都是逐条的，比如map()，flatMap()，filter()。DataStream 也可以执行 rebalance（再平衡，用来减轻数据倾斜）和 broadcaseted（广播）等分区转换。 
+
+![img](images/datastream-example.png)
+
+​		如上图的执行图所示，DataStream 各个算子会并行运行，算子之间是数据流分区。如 Source 的第一个并行实例（S1）和 flatMap() 的第一个并行实例（m1）之间就是一个数据流分区。而在 flatMap() 和 map() 之间由于加了 rebalance()，它们之间的数据流分区就有3个子分区（m1的数据流向3个map()实例）。
+
+## 常用数据流
+
+![img](images/flink-stream-type.png)
+
+### KeyedStream
+
+​		KeyedStream用来表示根据指定的key进行分组的数据流。一个KeyedStream可以通过调用DataStream.keyBy()来获得。而在KeyedStream上进行任何transformation都将转变回DataStream。在实现中，KeyedStream是把key的信息写入到了transformation中。每条记录只能访问所属key的状态，其上的聚合函数可以方便地操作和保存对应key的状态。 
+
+### WindowedStream **&** AllWindowedStream
+
+​		WindowedStream代表了根据key分组，并且基于WindowAssigner切分窗口的数据流。所以WindowedStream都是从KeyedStream衍生而来的。而在WindowedStream上进行任何transformation也都将转变回DataStream。
+
+```scala
+val stream: DataStream[MyType] = env.addSource(new FlinkKafkaConsumer08[String](...))
+val str1: DataStream[(String, MyType)] = stream.flatMap { ... }
+val str2: DataStream[(String, MyType)] = stream.rebalance()
+val str3: DataStream[AnotherType] = stream.map { ... }
+```
+
+上述 WindowedStream 的样例代码在运行时会转换成如下的执行图：
+
+![img](images/datastream-window-example.png)
+
+​		Flink 的窗口实现中会将到达的数据缓存在对应的窗口buffer中（一个数据可能会对应多个窗口）。当到达窗口发送的条件时（由Trigger控制），Flink 会对整个窗口中的数据进行处理。Flink 在聚合类窗口有一定的优化，即不会保存窗口中的所有值，而是每到一个元素执行一次聚合函数，最终只保存一份数据即可。
+
+​		在key分组的流上进行窗口切分是比较常用的场景，也能够很好地并行化（不同的key上的窗口聚合可以分配到不同的task去处理）。不过有时候我们也需要在普通流上进行窗口的操作，这就是 `AllWindowedStream`。`AllWindowedStream`是直接在DataStream上进行`windowAll(...)`操作。`AllWindowedStream` 的实现是基于 `WindowedStream` 的（Flink 1.1.x 开始）。Flink 不推荐使用`AllWindowedStream`，因为在普通流上进行窗口操作，就势必需要将所有分区的流都汇集到单个的Task中，而这个单个的Task很显然就会成为整个Job的瓶颈。
+
+> **<font color='red'>注意</font>**
+>
+> 不推荐使用AllWindowedStream，因为AllWindowedStream在执行时并发度为1。
+
+### JoinedStreams **&** CoGroupedStreams
+
+​		双流 Join 也是一个非常常见的应用场景。深入源码你可以发现，JoinedStreams 和 CoGroupedStreams 的代码实现有80%是一模一样的，JoinedStreams 在底层又调用了 CoGroupedStreams 来实现 Join 功能。除了名字不一样，一开始很难将它们区分开来，而且为什么要提供两个功能类似的接口呢？？
+
+​		实际上这两者还是很点区别的。首先 co-group 侧重的是group，是对同一个key上的两组集合进行操作，而 join 侧重的是pair，是对同一个key上的每对元素进行操作。co-group 比 join 更通用一些，因为 join 只是 co-group 的一个特例，所以 join 是可以基于 co-group 来实现的（当然有优化的空间）。而在 co-group 之外又提供了 join 接口是因为用户更熟悉 join（源于数据库吧），而且能够跟 DataSet API 保持一致，降低用户的学习成本。
+
+​		JoinedStreams 和 CoGroupedStreams 是基于 Window 上实现的，所以 CoGroupedStreams 最终又调用了 WindowedStream 来实现。
+
+```scala
+val firstInput: DataStream[MyType] = ...
+val secondInput: DataStream[AnotherType] = ...
+
+val result: DataStream[(MyType, AnotherType)] = firstInput.join(secondInput)
+    .where("userId").equalTo("id")
+    .window(TumblingEventTimeWindows.of(Time.seconds(3)))
+    .apply (new JoinFunction () {...})
+```
+
+上述 JoinedStreams 的样例代码在运行时会转换成如下的执行图：
+
+![img](images/datastream-join&group-example.png)
+
+​		双流上的数据在同一个key的会被分别分配到同一个window窗口的左右两个篮子里，当window结束的时候，会对左右篮子进行笛卡尔积从而得到每一对pair，对每一对pair应用 JoinFunction。不过目前（Flink 1.1.x）JoinedStreams 只是简单地实现了流上的join操作而已，距离真正的生产使用还是有些距离。因为目前 join 窗口的双流数据都是被缓存在内存中的，也就是说如果某个key上的窗口数据太多就会导致 JVM OOM（然而数据倾斜是常态）。双流join的难点也正是在这里，这也是社区后面对 join 操作的优化方向，例如可以借鉴Flink在批处理join中的优化方案，也可以用ManagedMemory来管理窗口中的数据，并当**数据超过阈值时能spill到硬盘**。
+
+### ConnectedStreams
+
+​		在 DataStream 上有一个 union 的转换 dataStream.union(otherStream1, otherStream2, …)，用来合并多个流，新的流会包含所有流中的数据。union 有一个限制，就是所有合并的流的类型必须是一致的。ConnectedStreams 提供了和 union 类似的功能，用来连接两个流，但是与 union 转换有以下几个区别：
+
+- ConnectedStreams 只能连接两个流，而 union 可以连接多于两个流。
+- ConnectedStreams 连接的两个流类型可以不一致，而 union 连接的流的类型必须一致。
+- ConnectedStreams 会对两个流的数据应用不同的处理方法，并且双流之间可以共享状态。这在第一个流的输入会影响第二个流时, 会非常有用。
+
+​		如下 ConnectedStreams 的样例，连接 input 和 other 流，并在input流上应用map1方法，在other上应用map2方法，双流可以共享状态（比如计数）。
+
+```scala
+val input: DataStream[MyType] = ...
+val other: DataStream[AnotherType] = ...
+
+val connected: ConnectedStreams[MyType, AnotherType] = input.connect(other)
+
+val result: DataStream[ResultType] = 
+        connected.map(new CoMapFunction[MyType, AnotherType, ResultType]() {
+            override def map1(value: MyType): ResultType = { ... }
+            override def map2(value: AnotherType): ResultType = { ... }
+        })
+```
+
+当并行度为2时，其执行图如下所示：
+
+![img](images/datastream-connect-example.png)
+
+## 数据流元素的类型
+
+![1563856676898](images/1563856676898.png)
+
+`StreamElement`是Flink中数据流的单个元素的抽象，包含了4中类型的`StreamElement`，如下。
+
+**StreamRecord**
+
+`StreamRecord`表示数据流中的一条记录（或者叫做一个事件），包含如下内容：
+
+- 数据的值本身
+- 事件戳（可选）
+
+**LatencyMarker**
+
+特殊的类型StreamRecord，携带如下信息：
+
+- ​	携带一个从source被创造出来的时间戳
+- ​	vertexId
+- ​	source operator的subtask index.
+
+在sink中，使用LatencyMarker可以估计数据在整个DAG图中流转花费的时间，用来近似的评估延时。
+
+**Watermark**
+
+Watermark是一个时间戳，用来告诉Operator，所有时间 <= Watermark的事件或记录都已经处理完毕，不会再有比Watermark更早的记录，Operator可以根据watermark 触发window的计算、清理资源等等。后边有详细介绍。
+
+**StreamStatus**
+
+`StreamStatus`可以表示两种状态：
+
+- **IDLE**
+- **ACTIVE**
+
+用来告诉Stream Task是否会继续接收到上游的记录或者Watermark。`StreamStatus`在Source Operator中生成，向下游沿着DAG传播。
+
+当`SourceStreamTask`或一般的`StreamTask`处于闲置状态（IDLE），不会向下游发送数据或者Watermark的时候，就向下游发送`StreamStatus#IDLE`状态告知下游，依次向下传递。当恢复向下游发送数据或者WaterMark前，首先发送`StreamStatus#ACTIVE`状态告知下游。
+
+
+
+**如何判断是Idle还是Active状态？**
+
+- 对于Source Task，如果读取不到输入数据，则认为是Idle状态，例如，Kafka Consumer未被赋予partition。如果重新读取到数据了，则认为是Active状态。
+- 当StreamTask的所有SourceTask **全部** 处于**Idle**状态的时候认为这个StreamTask处于IDEL状态，只要有一个上游的Source Task是**Active**状态，StreamTask就是**Active**状态。
+
+**Stream Status如何影响Watermark？**
+
+由于SourceTask保证在**Idle**状态和**Active**状态之间不会发生数据元素，所以StreamTask可以在不需要检查当前的状态的情况下安全的处理和传播收到数据元素。但是由于在DAG的任何中间节点都可能产生watermark，所以当前StreamTask在发送watermark之前必须检查当前Operator的状态,如果当前的状态是**Idle**,则watermark会被阻塞，不会向下游发送。
+
+如果StreamTask有多个上游输入，有两种情况：
+
+- 上游输入的Watermark状态为Idle
+- 恢复到Active状态，但是其Watermark落后于当前Operator的最小Watermark，此时需要忽略这一个特殊的Watermark。在判断是否需要向前推进Watermark和向下游发送的时候，这个特殊Watermark不起作用。
+
+> **注意**
+>
+> 当Source通知下游SourceTask永久关闭，并且再也不会向下游发送数据的时候，会发送一个的值为`Watermark.MAX_WATERMARK`的watermark而不是一个`StreamStatus#IDLE`状态。
+>
+> `StreamStatus`只是用作临时性的停止数据发送和恢复发送的情况。
+
+
+
+## Flink DataStream应用的基本结构
+
+### 基本代码框架
+
+Flink DataStream 应用的总体结构如下：
+
+1. **获取参数（可选）**
+
+   如果有配置参数，则读取配置参数，可以是命令行输入的参数，也可以是配置文件（配置文件可能是命令行给的1个配置文件路径）。
+
+2. **初始化Stream执行环境**
+
+   这是必须要做的，读取数据的API依赖于该执行环境。
+
+3. **配置参数**
+
+   把读取到的参数，可以是执行环境参数或者业务参数。执行环境参数调用对应的API赋予即可，这些参数会覆盖到flink.conf中默认的配置参数，例如最大并行度**maxParallism**等。如果是业务级的参数，可以放入`GlobalJobParameters`中，在Job执行是从`GlobalJobParameters`读取参数。
+
+   一般在生产或者实际的应用场景中，多多少少需要提供一些配置信息，如果只是为了学习用途，则可以不用考虑。
+
+   > `GlobalJobParameters`可以视作一个Map。具体细节可以参照《官方文档》
+   >
+   > 点击[执行环境参数](https://ci.apache.org/projects/flink/flink-docs-release-1.8/dev/execution_configuration.html)查看官方文档中执行参数的详细说明。
+
+4. **读取外部数据**
+
+   Flink作为分布式执行引擎，本身没有数据的存储能力，所以定义了一系列接口、连接器与外部存储进行交互，读写数据。
+
+   在Flink中数据来源叫做**Source**。
+
+5. **数据处理流程**
+
+   调用DataStream的API组成数据处理的流程。
+
+   例如调用 `DataStream.map().filter()...`组成一个数据处理的pipeline。
+
+6. **将处理结果写入外部**
+
+   在Flink中将数据写入外部的过程叫做**Sink**。
+
+7. **触发执行**
+
+   `StreamExecutionEnvironment.execute()`是Flink应用执行的触发入口，无论是一般的DataStrea API开发还是Table &SQL 开发都是如此。
+
+   调用该API之后，才会触发后续的一系列生成`StreamGraph`、`JobGraph`、`ExecutionGraph`、`任务分发`执行的过程。
+
+   
+
+### WordCount示例
+
+```java
+public class WordCount {
+
+	public static void main(String[] args) throws Exception {
+
+		// 1.从命令行读取参数
+		final ParameterTool params = ParameterTool.fromArgs(args);
+
+		// 2.初始化执行环境
+		final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+		// 3.设置配置参数
+		env.getConfig().setGlobalJobParameters(params);
+
+		// 4.读取外部数据
+		DataStream<String> text;
+		if (params.has("input")) {
+			// 从input参数指定的路径读取文本文件
+			text = env.readTextFile(params.get("input"));
+		} else {
+			System.out.println("Executing WordCount example with default input data set.");
+			System.out.println("Use --input to specify file input.");
+			// 如果没有使用input参数给定路径，则从WordCountData.WORDS读取写死在代码中的字符串
+			text = env.fromElements(WordCountData.WORDS);
+		}
+		
+        // 5.数据处理流程
+		DataStream<Tuple2<String, Integer>> counts =
+			// 首先将每一行文本进行split，生成一个个的Tuple2(单词,1),第1个字段是单词本身，第2个字段是个数
+			text.flatMap(new Tokenizer())
+			// 按照Tuple的第1个字段(Tuple2(0)分组，对Tuple的第二个字段(Tuple2(1))求和
+			.keyBy(0).sum(1);
+
+		// 6.将处理结果写入到外部存储
+		if (params.has("output")) {
+			counts.writeAsText(params.get("output"));
+		} else {
+			System.out.println("Printing result to stdout. Use --output to specify output path.");
+			counts.print();
+		}
+
+		// 7.触发执行
+		env.execute("Streaming WordCount");
+	}
+```
+
+
+
+## Flink执行环境
+
+![1564130405446](images/1564130405446.png)
+
+`StreamExecutionEnvironment`是flink流计算应用的执行环境。该对象提供了控制Job执行、容错和与Flink引擎之外的系统交互（例如数据的读取和写入）。
+
+**LocalStreamEnvironment**
+
+本地执行环境，在单个JVM中使用多线程模拟flink集群。
+
+一般用作本地开发、调试。使用Idea之类的IDE工具，可以比较方便的在代码中，设置断点调试，单元测试。测试没有问题，就可以提交到真正的生产集群。
+
+其基本的工作流程：
+
+1. 将env的streamgraph转化为jobgraph
+
+2. 设置任务运行的配置信息configuration
+
+3.  启动LocalFlinkMiniCluster
+
+4. 提交jobgraph到LocalFlinkMiniCluster。
+
+   
+
+**RemoteStreamEnvirment**
+
+集群执行环境，真正的生产环境。
+
+当将Job发布到Flink集群的时候，使用`RemoteStreamEnvirment`。
+
+
+
+## DataStream API
+
+### 读取数据
+
+#### 内存集合
+
+`StreamExecutionEnvironment`提供的API如下：
+
+![1564127203790](images/1564127203790.png)
+
+直接在内存中生成数据序列、从对象读取或者Collection集合，一般用来进行测试，实际环境中几乎不会用到。
+
+#### 文件
+
+`StreamExecutionEnvironment`提供的API如下：
+
+![1564127434828](images/1564127434828.png)
+
+**读取文本文件**
+
+`readTextFile`的两个API定义
+
+```java
+public DataStreamSource<String> readTextFile(String filePath)
+    
+public DataStreamSource<String> readTextFile(String filePath, String charsetName)
+```
+
+`filePath`是文本文件的路径，`charsetName`是字符集，如果不指定字符集则使用**UTF-8**字符集。
+
+> 使用`readTextFile`都的文件，必须要遵循`TextInputFormat`的规则。
+
+**读取文件**
+
+`readFile`的API的定义
+
+```java
+
+public <OUT> DataStreamSource<OUT> readFile(FileInputFormat<OUT> inputFormat,
+												String filePath)
+    
+ 
+public <OUT> DataStreamSource<OUT> readFile(FileInputFormat<OUT> inputFormat,
+												String filePath,
+												FileProcessingMode watchType,
+												long interval)
+  
+public <OUT> DataStreamSource<OUT> readFile(FileInputFormat<OUT> inputFormat,
+												String filePath,
+												FileProcessingMode watchType,
+												long interval,
+												TypeInformation<OUT> typeInformation)
+//已废弃
+public <OUT> DataStreamSource<OUT> readFile(FileInputFormat<OUT> inputFormat,
+												String filePath,
+												FileProcessingMode watchType,
+												long interval,
+												FilePathFilter filter)
+//已废弃
+public DataStream<String> readFileStream(String filePath, 
+                                         		long intervalMillis, 
+                                         		FileMonitoringFunction.WatchType watchType)
+```
+
+
+
+参数说明：
+
+| 参数                | 说明                                                         | 示例                                                         |
+| ------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| **inputFormat**     | 创建DataStream指定的输入格式，文件读取的具体逻辑在此对象中实现。 | AvroInputFormat<br />CSVInputFormat                          |
+| **filePath**        | 文件的路径                                                   | file:///some/local/file.dat <br /> hdfs://host:port/file/path |
+| **watchType**       | 文件读取的模式，如果不指定则默认为一次性读取。<br />一次性读取文件`FileProcessingMode.PROCESS_ONCE` <br />持续读取`FileProcessingMode.PROCESS_CONTINUOUSLY` |                                                              |
+| **interval**        | 使用持续读取模式时，读取的时间间隔，单位为ms。<br />间隔越小实时性越高，资源消耗相应变多，反之则实时性越低，资源消耗降低。 | 100ms                                                        |
+| **typeInformation** | 返回数据流的类型，详细参加《Flink类型与序列化》章节          |                                                              |
+
+> <font color=red>注意</font>
+>
+> 1. 一般在流计算中使用`FileProcessingMode.PROCESS_CONTINUOUSLY`，当读取的文件被修改时，Flink会将文件整体重新读取，重新处理，会导致数据重复处理。
+> 2. 当使用`FileProcessingMode.PROCESS_ONCE`，读取数据完毕之后，关闭Source，不再checkpoint，当出现问题需要恢复job的时候，可能会花费更多的时间。
+
+
+
+#### Socket
+
+`StreamExecutionEnvironment`提供的API如下：
+
+![1564127489174](images/1564127489174.png)
+
+
+
+`socketTextStream` API定义：
+
+```java
+public DataStreamSource<String> socketTextStream(String hostname, int port)
+
+public DataStreamSource<String> socketTextStream(String hostname, int port, String delimiter)
+
+public DataStreamSource<String> socketTextStream(String hostname, int port, String delimiter, long maxRetry)
+
+//标记为废弃
+@Deprecated
+public DataStreamSource<String> socketTextStream(String hostname, int port, char delimiter)
+    
+@Deprecated
+public DataStreamSource<String> socketTextStream(String hostname, int port, char delimiter, long maxRetry)
+    
+```
+
+`socketTextStream`的参数比较简单，需要提供`hostname`主机名、`port`端口号、`delimiter`分隔符、`maxRetry`最大重试次数。
+
+#### 自定义（自定义部分待修改完善）
+
+`StreamExecutionEnvironment`提供的API如下：
+
+![1564127813401](images/1564127813401.png)
+
+`createInput`方法底层调用的是`addSource`，封装为`InputFormatSourceFunction`，所以自定义的方式，其本质就是实现自定义的`SourceFunction`。
+
+`SourceFunction`的类继承关系如下
+
+![1564213208953](images/1564213208953.png)
+
+- **SourceFunction**
+
+  流数据源顶层接口
+
+- **ParallelSourceFunction**
+
+  并行数据源接口
+
+- **RichParallelSourceFunction**
+
+  并行数据源抽象类。
+
+- **RickSourcefunction**
+
+  并行数据源抽象类。
+
+RickParallelSourceFunction和RickSourceFunction的区别在于
+
+### 写出数据
+
+数据的读取的API是绑定在`StreamExecutionEnvironment`上的，数据的写出的API是绑定在`DataStream`对象上，与读取的API相比，写出的API相对要少一些。
+
+#### 控制台
+
+![1564132109819](images/1564132109819.png)
+
+​		将`DataStream`中的每一个元素输出到控制台。
+
+#### 文件
+
+![1564132138532](images/1564132138532.png)
+
+**写入文本文件**
+
+`writeAsText`API定义
+
+```java
+public DataStreamSink<T> writeAsText(String path)
+public DataStreamSink<T> writeAsText(String path, WriteMode writeMode)
+```
+
+使用`TextOutputFormat`写到文本文件中。
+
+如果文件存在则根据`WriteMode`，是`NO_OVERWRITE`则不会修改已存在的问题件，是`OVERWRITE`则会覆盖当前文件。
+
+**写入Csv文件**
+
+`writeAsCsv`API定义
+
+```java
+public DataStreamSink<T> writeAsCsv(String path)
+    
+public DataStreamSink<T> writeAsCsv(String path, WriteMode writeMode)
+    
+public <X extends Tuple> DataStreamSink<T> writeAsCsv(String path,
+														WriteMode writeMode,
+														String rowDelimiter,
+														String fieldDelimiter)
+```
+
+使用`CsvOutpuFormat`写出到csv文件中。
+
+如果文件存在则根据`WriteMode`，是`NO_OVERWRITE`则不会修改已存在的问题件，是`OVERWRITE`则会覆盖当前文件。
+
+| 参数           | 说明                               | 实例                                             |
+| -------------- | ---------------------------------- | ------------------------------------------------ |
+| path           | 写入文件路径                       |                                                  |
+| writeMode      | 写入文件时文件已经存在时的处理策略 | `WriteMode.NO_OVERWRITE` 或`WriteMode.OVERWRITE` |
+| rowDelimiter   | 行分隔符，一般是回车换行符         | \n                                               |
+| fieldDelimiter | 列分隔符                           | 如' , '或者' \| '                                |
+
+#### Socket
+
+![1564132183610](images/1564132183610.png)
+
+`writeToSocket` API定义
+
+```java
+public DataStreamSink<T> writeToSocket(String hostName, int port, SerializationSchema<T> schema)
+```
+
+将`DataStream`中类型为T的数据，使用`SerializationSchema`序列化之后写入socket。
+
+#### 自定义
+
+![1564132263316](images/1564132263316.png)
+
+API定义
+
+```java
+public DataStreamSink<T> writeUsingOutputFormat(OutputFormat<T> format)
+    
+public DataStreamSink<T> addSink(SinkFunction<T> sinkFunction)
+```
+
+自定义中提供了`writeUsingOutputFormat`和`addSink`两个接口。其中`writeUsingOutputFormat`最终封装为一个`OutputFormatSinkFunction`，所以本质上来说自定义的方式就是自定`SinkFunction`。
+
+> `OutputFormatSinkFunction`已经被标记为Deprecated废弃，建议使用`BucketingSink`写文件。目前在DataStream中暂时仍然保留了`writeUsingOutputFormat`，未来实现可能会有改动。
+
+**SinkFunction继承体系**
+
+![1564225232401](images/1564225232401.png)
+
+- **SinkFunction**
+
+  Sink的顶层接口
+
+- **RichSinkFunction**
+
+  增加了生命周期的管理，如open、close方法。
+
+- **TwoPhaseCommitSinkFunction**
+
+  TwoPhaseCommitSinkFunction是实现端到端Exactly-Once的关键。
+
+### 处理数据
+
+DataStream 数据处理API接口如下
+
+![1564132794657](images/1564132794657.png)
+
+#### DataStream转换
+
+##### Map
+
+**转换过程：**`DataStream` → `DataStream`
+
+接收一个元素，输出一个元素。
+
+`MapFunction<T,O>`中T代表输入数据类型(map方法的参数类型)，O代表操作结果输出类型(map方法返回数据类型)。
+
+代码示例：
+
+```java
+
+DataStream<Integer> dataStream = //...
+dataStream.map(new MapFunction<Integer, Integer>() {
+    @Override
+    public Integer map(Integer value) throws Exception {
+        return 2 * value;
+    }
+});
+```
+
+
+
+##### FlatMap
+
+**转换过程：**`DataStream` → `DataStream`
+
+接收一个元素，输出0、1 .... N个元素。
+
+`FlatMapFunction<T,O>`中T代表输入数据类型(flatMap方法的参数类型)，O代表操作结果输出类型(flatMap方法返回数据类型)。
+
+代码示例：
+
+```java
+DataStream<Integer> dataStream = //...
+dataStream.flatMap(new FlatMapFunction<String, String>() {
+    @Override
+    public void flatMap(String value, Collector<String> out)
+        throws Exception {
+        for(String word: value.split(" ")){
+            out.collect(word);
+        }
+    }
+});
+```
+
+
+
+##### Filter
+
+**转换过程：**`DataStream` → `DataStream`
+
+过滤数据，如果返回`true`则该元素继续向下传递，如果为`false`则将该元素过滤掉。
+
+FilterFunction<T>中T代表输入元素的数据类型。
+
+代码示例：
+
+```java
+dataStream.filter(new FilterFunction<Integer>() {
+    @Override
+    public boolean filter(Integer value) throws Exception {
+        return value != 0;
+    }
+});
+```
+
+
+
+##### KeyBy
+
+**转换过程：**`DataStream` → `KeyedStream`
+
+将数据流元素进行逻辑上的分区，具有相同key的记录将被划分到同一分区。**KeyBy()**使用Hash Partitioner实现。
+
+返回类型为`KeyedStream<T,KEY>`，其中`T`代表`KeyedStream`中元素数据类型，`KEY`代表逻辑`KEY`的数据类型。
+
+> 数据无法作为Key的情况：
+>
+> 1. POJO类未重写*hashCode()*，使用了默认的*Object.hashCode()*。
+>
+> 2. 数组
+
+代码示例：
+
+```java
+dataStream.keyBy("someKey") // 按照字段 "someKey"进行分组
+dataStream.keyBy(0) // 按照Tuple中的第1个字段进行分组,即Tuple(0)
+```
+
+
+
+##### Reduce
+
+**转换过程：**`KeyedStream` → `DataStream`
+
+按照KeyedStream中的逻辑key，分组进行合并，将当前数据与最后一次的reduce结果进行合并，合并逻辑由开发者自己实现。
+
+`ReduceFunction<T>`中的`T`代表`KeyedStream`中元素的数据类型。
+
+代码示例：
+
+```java
+keyedStream.reduce(new ReduceFunction<Integer>() {
+    @Override
+    public Integer reduce(Integer value1, Integer value2)
+    throws Exception {
+        return value1 + value2;
+    }
+});
+```
+
+
+
+##### Fold
+
+**转换过程：**`KeyedStream` → `DataStream`
+
+Fold与Reduce是类似的，区别在于Fold是一个提供了初始值的Reduce，用初始值进行合并运算。
+
+`FoldFunction<O, T>`中的`O`为KeyStream中数据类型，`T`为初始值类型和fold方法返回值类型。
+
+代码示例：
+
+```java
+DataStream<String> result =
+  keyedStream.fold("start", new FoldFunction<Integer, String>() {
+    @Override
+    public String fold(String current, Integer value) {
+        return current + "-" + value;
+    }
+  });
+```
+
+> `FoldFunction<O, T>`已经被标记为**Deprecated废弃**。替代接口是`AggregateFunction<IN, ACC, OUT>`。
+
+
+
+##### Aggregations
+
+**转换过程：**`KeyedStream` → `DataStream`
+
+渐进聚合具有相同key的数据流元素，以`min`和`minBy`为例，`min`返回的是整个KeyedStream的最小值，`minBy`按照key进行分组，返回每个分组的最小值。
+
+返回`DataStream<T>`，`T`为聚合之后的结果。
+
+代码示例：
+
+```java
+keyedStream.sum(0);
+keyedStream.sum("key");
+keyedStream.min(0);
+keyedStream.min("key");
+keyedStream.max(0);
+keyedStream.max("key");
+keyedStream.minBy(0);
+keyedStream.minBy("key");
+keyedStream.maxBy(0);
+keyedStream.maxBy("key");
+```
+
+
+
+##### Window
+
+**转换过程：**`KeyedStream` → `WindowedStream`
+
+对`KeyedStream`的数据，按照Key进行时间窗口切分切分，例如：每5秒钟一个滚动窗口，每个key都有自己的窗口。
+
+返回`WindowedStream<T, K, W extends Window>`，`T`为`KeyedStream`中元素数据类型，`K`为指定Key的数据类型，`W`为窗口类型。
+
+代码示例：
+
+```java
+// 时间长度为5秒钟的Tumble窗口
+dataStream.keyBy(0).window(TumblingEventTimeWindows.of(Time.seconds(5))); 
+```
+
+> 关于窗口请参照**Window原理和机制**章节。
+
+
+
+##### WindowAll
+
+**转换过程：**`DataStream` → `AllWindowedStream`
+
+对一般的`DataStream`进行时间窗口切分，没有key。例如：每5秒钟一个滚动窗口。
+
+代码示例：
+
+```java
+// 时间长度为5秒钟的Tumble窗口
+dataStream.windowAll(TumblingEventTimeWindows.of(Time.seconds(5))); 
+```
+
+> <font color=red>**注意**</font>
+>
+> 在一般的`DataStream`上进行窗口切分，往往会导致无法并行计算，所有的数据会集中到**WindowAll**算子的一个task上。
+
+> 关于窗口请参照**Window原理和机制**章节。
+
+
+
+##### Window Apply
+
+**转换过程：**`WindowedStream` → `DataStream`	`AllWindowedStream` → `DataStream`
+
+将Window函数应用到窗口上，Window函数将一个窗口的数据作为整体进行处理。
+
+在`WindowedStream`上应用`WindowFunction`，在`AllWindowedStream`上应用`AllWindowFunction`。
+
+- **WindowStream**
+
+  `WindowFunction<IN, OUT, KEY, W extends Window>`，`IN`表示输入值的类型，`OUT`表示输出值的类型，`KEY`表示Key的类型，`W`表示窗口的类型。
+
+  代码示例：
+
+  ```
+  windowedStream.apply (new WindowFunction<Tuple2<String,Integer>, Integer, Tuple, Window>() {
+      public void apply (Tuple tuple,
+              Window window,
+              Iterable<Tuple2<String, Integer>> values,
+              Collector<Integer> out) throws Exception {
+          int sum = 0;
+          for (value t: values) {
+              sum += t.f1;
+          }
+          out.collect (new Integer(sum));
+      }
+  });
+  ```
+
+  
+
+- **AllWindowStream**
+
+  `AllWindowFunction<IN, OUT, W extends Window>` ，`IN`表示输入值的类型，`OUT`表示输出值的类型，`W`表示窗口的类型。
+
+  代码示例：
+
+  ```
+  
+  allWindowedStream.apply (new AllWindowFunction<Tuple2<String,Integer>, Integer, Window>() {
+      public void apply (Window window,
+              Iterable<Tuple2<String, Integer>> values,
+              Collector<Integer> out) throws Exception {
+          int sum = 0;
+          for (value t: values) {
+              sum += t.f1;
+          }
+          out.collect (new Integer(sum));
+      }
+  });
+  ```
+
+  
+
+##### Window Reduce
+
+**转换过程：**`WindowedStream` → `DataStream`
+
+在`WindowedStream`上应用`ReduceFunction`，参见前边**Reduce**章节。
+
+代码示例：
+
+```java
+windowedStream.reduce (new ReduceFunction<Tuple2<String,Integer>>() {
+    public Tuple2<String, Integer> reduce(Tuple2<String, Integer> value1, Tuple2<String, Integer> value2) throws Exception {
+        return new Tuple2<String,Integer>(value1.f0, value1.f1 + value2.f1);
+    }
+});
+```
+
+
+
+##### Window Fold
+
+**转换过程：**`WindowedStream` → `DataStream`
+
+在`WindowedStream`上应用`FoldFunction`，参见前边**Fold**章节。
+
+代码示例：
+
+```java
+windowedStream.fold("start", new FoldFunction<Integer, String>() {
+    public String fold(String current, Integer value) {
+        return current + "-" + value;
+    }
+});
+```
+
+
+
+##### Window Aggregation
+
+`WindowedStream` → `DataStream`
+
+在`WindowedStream`上应用`AggregationFunction`，参见前边**Aggregations**章节。
+
+代码示例：
+
+```java
+windowedStream.sum(0);
+windowedStream.sum("key");
+windowedStream.min(0);
+windowedStream.min("key");
+windowedStream.max(0);
+windowedStream.max("key");
+windowedStream.minBy(0);
+windowedStream.minBy("key");
+windowedStream.maxBy(0);
+windowedStream.maxBy("key");
+```
+
+
+
+##### Union
+
+**转换过程：**`DataStream`* → `DataStream`
+
+把两个或多个`DataStream`合并，所有`DataStream`中的元素都会组合成一个新的`DataStream`，不去重。如果联合自身，则每个元素在新的`DataStream`出现两次。
+
+代码示例：
+
+```java
+dataStream.union(otherStream1, otherStream2, ...);
+```
+
+
+
+##### Window Join
+
+`DataStream`，`DataStream` → `DataStream`
+
+ 在相同的时间范围的窗口上join两个数据流。
+
+Join核心逻辑在`JoinFunction<IN1,IN2,OUT>`中实现，`IN1`为第一个DataStream中的数据类型，`IN2`为第二个`DataStream`中的数据类型，`OUT`为`Join`结果数据类型。
+
+代码示例：
+
+```java
+dataStream.join(otherStream)
+    .where(<key selector>).equalTo(<key selector>)
+    .window(TumblingEventTimeWindows.of(Time.seconds(3)))
+    .apply (new JoinFunction () {...});
+```
+
+
+
+##### Interval Join
+
+**转换过程：**`KeyedStream`，`KeyedStream` → `DataStream`
+
+对指定的时间间隔内使用相同key来join两个**KeyedStream**。
+
+例如对于事件**e1**和**e2**，key相同，时间判断条件为：
+
+```sql
+e1.timestamp + lowerBound <= e2.timestamp <= e1.timestamp + upperBound
+```
+
+Join的核心逻辑在`ProcessJoinFunction<IN1,IN2,OUT>`中实现，`IN1`为第一个DataStream中元素数据类型，`IN2`为第二个`DataStream`中的元素数据类型，`OUT`为结果输出类型。
+
+代码示例：
+
+```java
+// join两个KeyedStream
+// join条件为key1 == key2 && leftTs - 2 < rightTs < leftTs + 2
+keyedStream.intervalJoin(otherKeyedStream)
+    .between(Time.milliseconds(-2), Time.milliseconds(2)) // 上限和下限
+    .upperBoundExclusive(true) // 可选参数
+    .lowerBoundExclusive(true) // 可选参数
+    .process(new IntervalJoinFunction() {...});
+```
+
+
+
+##### WindowCoGroup
+
+`DataStream`，`DataStream` → `DataStream`
+
+对两个指定的key的`DataStream`，在相同时间窗口上执行`CoGroup`，`CoGroup`和`Join`功能类似，但是更加灵活。
+
+`CoGroupFunction<IN1, IN2, O>`，`IN1`代表第一个DataStream中元素类型，`IN2`代表第二个DataStream中元素类型，`O`为结果输出集合类型。
+
+**代码示例**
+
+```java
+dataStream.coGroup(otherStream)
+    .where(0).equalTo(1)
+    .window(TumblingEventTimeWindows.of(Time.seconds(3)))
+    .apply (new CoGroupFunction () {...});
+```
+
+
+
+##### Connect
+
+`DataStream`，`DataStream` → `ConnectedStreams`
+
+连接(connect)两个流，并且保留其类型。两个数据流之间可以共享状态。
+
+`ConnectedStreams<IN1,IN2>`，`IN1`代表第1个数据流中的数据类型，`IN2`表示第2个数据流中的数据类型。
+
+**代码示例**
+
+```java
+DataStream<Integer> someStream = //...
+DataStream<String> otherStream = //...
+
+ConnectedStreams<Integer, String> connectedStreams = someStream.connect(otherStream);
+```
+
+
+
+##### CoMap和CoFlatMap
+
+`ConnectedStreams` → `DataStream`
+
+在`ConnectedStreams`执行map和flatMap运算，其基本逻辑类似于在一般的DataStream上的map和flatMap运算，区别在于CoMap转换有2个输入，Map转换有1个输入，CoFlatMap同样。
+
+**代码示例**
+
+```java
+//CoMap
+connectedStreams.map(new CoMapFunction<Integer, String, Boolean>() {
+    @Override
+    public Boolean map1(Integer value) {
+        return true;
+    }
+
+    @Override
+    public Boolean map2(String value) {
+        return false;
+    }
+});
+
+//CoFlatMap
+connectedStreams.flatMap(new CoFlatMapFunction<Integer, String, String>() {
+   @Override
+   public void flatMap1(Integer value, Collector<String> out) {
+       out.collect(value.toString());
+   }
+
+   @Override
+   public void flatMap2(String value, Collector<String> out) {
+       for (String word: value.split(" ")) {
+         out.collect(word);
+       }
+   }
+});
+```
+
+
+
+##### Split
+
+`DataStream` → `SplitStream`
+
+将`DataStream`按照条件切分为多个`DataStream`
+
+**代码示例**
+
+```java
+SplitStream<Integer> split = someDataStream.split(new OutputSelector<Integer>() {
+    @Override
+    public Iterable<String> select(Integer value) {
+        List<String> output = new ArrayList<String>();
+        if (value % 2 == 0) {
+            output.add("even");
+        }
+        else {
+            output.add("odd");
+        }
+        return output;
+    }
+});
+```
+
+> 该方法已经标记为**Deprecated废弃**。以后使用**SideOutput**。
+
+
+
+##### Select
+
+`SplitStream` → `DataStream`
+
+`SplitStream`中切分了多个`DataStream`，`Select`就是选择其中某一个具体的`DataStream`。
+
+**代码示例**
+
+```java
+SplitStream<Integer> split;
+DataStream<Integer> even = split.select("even");
+DataStream<Integer> odd = split.select("odd");
+DataStream<Integer> all = split.select("even","odd");
+```
+
+
+
+##### Iterate
+
+`DataStream` → `IterativeStream` → `DataStream`
+
+在`DAG`中创建一个反馈循环，即将`下游Operator`的输出发送给`上游的某个Operator`作为输入。如果一个算法会持续的更新模型，这种情况下反馈循环比较有用。
+
+**代码示例**
+
+```java
+//创建一个IterativeStream
+IterativeStream<Long> iteration = initialStream.iterate();
+//在IterativeStream执行map转换
+DataStream<Long> iterationBody = iteration.map (/*业务逻辑*/);
+
+//大于0的值进入反馈循环通道，小于0的值直接发送给下游
+DataStream<Long> feedback = iterationBody.filter(new FilterFunction<Long>(){
+    @Override
+    public boolean filter(Long value) throws Exception {
+        return value > 0;
+    }
+});
+iteration.closeWith(feedback);
+DataStream<Long> output = iterationBody.filter(new FilterFunction<Long>(){
+    @Override
+    public boolean filter(Long value) throws Exception {
+        return value <= 0;
+    }
+});
+```
+
+
+
+##### Extract Timestamps
+
+`DataStream` → `DataStream`
+
+从记录中提取时间戳，并生成Watermark。
+
+**代码示例**
+
+```java
+//只提取时间戳，旧的api，已经废弃
+stream.assignTimestamps (new TimeStampExtractor() {...});
+
+//提取时间戳并生成Watermark
+stream.assignTimestamps (new AssignerWithPunctuatedWatermarks<T>(){...});
+stream.assignTimestamps (new AssignerWithPunctuatedWatermarks<T>(){...});
+```
+
+> `assignTimestamps`已经标记为Deprecated，以后使用`assignTimestampsAndWatermarks`
+
+
+
+##### Project
+
+`DataStream` → `DataStream`
+
+只适用于`Tuple`类型的`DataStream`，使用`Project`选取子Tuple，可以选择Tuple的部分元素，可以改变元素顺序。
+
+**代码示例**
+
+```java
+DataStream<Tuple3<Integer, Double, String>> in = // [...]
+DataStream<Tuple2<String, Integer>> out = in.project(2,0);
+```
+
+
+
+#### DataStream分区
+
+DataStream分区，又叫做partition，其本质上是一种复杂均衡机制，提供了多种负载均衡机制，并且允许用户实现自定义的负载均衡函数。
+
+##### 自定义分区
+
+`DataStream` → `DataStream`
+
+使用用户自定义分区函数，为每一个元素选择目标分区。
+
+**代码示例**
+
+```java
+dataStream.partitionCustom(partitioner, "someKey");
+dataStream.partitionCustom(partitioner, 0);
+```
+
+
+
+##### 随机分区Shuffle
+
+`DataStream` → `DataStream`
+
+随机将元素进行分区，可以确保下游的subtask能够均匀的获得数据。
+
+**代码示例**
+
+```java
+dataStream.shuffle();
+```
+
+##### 重平衡分区Reblance
+
+`DataStream` → `DataStream`
+
+以**Round-robin**的方式为每个元素分配分区均，可以确保下游的subtask可以均匀的获得数据，避免数据倾斜。
+
+**代码示例**
+
+```java
+dataStream.rebalance();
+```
+
+
+
+##### Rescaling分区
+
+`DataStream` → `DataStream`
+
+根据上下游subtask的数量进行分区。使用**Round-robin**选择下游的一个subtask子集进行数据分区，例如上游有2个subtask **Src**，下游有6个**Map**，那么每个**Src**会分配三个固定的下游**Map**，不会向未分配给自己的分区写入数据。与随机分区和重平衡分区，此两者会写入下游所有的分区。
+
+![img](images/rescale.svg)
+
+**代码示例**
+
+```java
+dataStream.rescale();
+```
+
+
+
+##### 广播分区Broadcast
+
+`DataStream` → `DataStream`
+
+将该记录广播给所有分区，即有N个分区，就把数据复制N份，每个分区1份。
+
+**代码示例**
+
+```java
+dataStream.broadcast();
+```
+
+## 内置Connector
+
+## SideOuput旁路输出
+
+**SideOutput**的功能类似于**DataStream.split()**，用于将`DataStream`切分为多个`子DataStream`，`子DataStream`叫做旁路输出DataStream，每个旁路输出`DataStream`可以有自己的下游处理逻辑，输出到不同的外部存储。特别适合于同一份数据，进行不同类似的处理，写入到不同的外部系统中的场景。
+
+旁路输出`DataStream`的元素的数据类型，可以与`DataStream`不同，多个旁路输出`DataStream`之间数据类型也不必相同。
+
+当使用旁路输出的时候，首先需要定义`OutputTag`。
+
+**定义OutputTag**
+
+```java
+OutputTag<String> outputTag = new OutputTag<String>("side-output-name") {};
+```
+
+`OutputTag`的`String`表示该旁路输出的类型为`String`。"side-output-name"是给定该旁路输出的名称。
+
+**旁路输出函数**
+
+定义好`OutputTag`之后，必须在特定的函数中才能使用旁路输出，如下：
+
+- ProcessFunction
+- KeyedProcessFunction
+- CoProcessFunction
+- ProcessWindowFunction
+- ProcessAllWindowFunction
+
+只有在上述函数中才可以通过`Context`对象，向`OutputTag`定义的旁路输出中emit数据。
+
+**旁路输出示例**
+
+```java
+DataStream<Integer> input = ...;
+//定义1个旁路输出
+final OutputTag<String> outputTag = new OutputTag<String>("side-output"){};
+
+SingleOutputStreamOperator<Integer> mainDataStream = input
+  .process(new ProcessFunction<Integer, Integer>() {
+
+      @Override
+      public void processElement(
+          Integer value,
+          Context ctx,
+          Collector<Integer> out) throws Exception {
+        // 向常规的DataStream中emit数据
+        out.collect(value);
+
+        // 向旁路输出中emit数据
+        ctx.output(outputTag, "sideout-" + String.valueOf(value));
+      }
+    });
+```
+
+
+
+**获取旁路输出数据**
+
+`DataStream`使用`getSideOutput(OutputTag)`来获取旁路输出，如下所示：
+
+```java
+final OutputTag<String> outputTag = new OutputTag<String>("side-output"){};
+
+SingleOutputStreamOperator<Integer> mainDataStream = ...;
+
+//获得旁路输出DataStream，然后可以对将旁路输出DataStream当做一般的DataStream进行处理
+DataStream<String> sideOutputStream = mainDataStream.getSideOutput(outputTag);
+```
+
+
+
+> `Table & SQL`的语义中目前没有`SideOutput`旁路输出的概念。
+
+
+
 # Flink类型与序列化系统
 
 ## Flink类型系统
@@ -357,161 +2035,6 @@ Flink Table模块之中额外定义了`LogicalType`（类型），`LogicalType`�
 ### LogicalType与原有类型系统的对应关系
 
 
-
-# Flink中常见的数据流的类型
-
-## 数据流（DataStream）是什么
-
-​		DataStream 是 Flink 流处理 API中最核心的数据结构。它代表了一个运行在多个分区上的并行流。一个 DataStream 可以从 StreamExecutionEnvironment 通过env.addSource(SourceFunction) 获得 。
-
-​		DataStream 上的转换操作都是逐条的，比如map()，flatMap()，filter()。DataStream 也可以执行 rebalance（再平衡，用来减轻数据倾斜）和 broadcaseted（广播）等分区转换。 
-
-![img](./images/datastream-example.png)
-
-​		如上图的执行图所示，DataStream 各个算子会并行运行，算子之间是数据流分区。如 Source 的第一个并行实例（S1）和 flatMap() 的第一个并行实例（m1）之间就是一个数据流分区。而在 flatMap() 和 map() 之间由于加了 rebalance()，它们之间的数据流分区就有3个子分区（m1的数据流向3个map()实例）。
-
-##  常用数据流
-
-![img](./images/flink-stream-type.png)
-
-### KeyedStream
-
-​		KeyedStream用来表示根据指定的key进行分组的数据流。一个KeyedStream可以通过调用DataStream.keyBy()来获得。而在KeyedStream上进行任何transformation都将转变回DataStream。在实现中，KeyedStream是把key的信息写入到了transformation中。每条记录只能访问所属key的状态，其上的聚合函数可以方便地操作和保存对应key的状态。 
-
-### WindowedStream **&** AllWindowedStream
-
-​		WindowedStream代表了根据key分组，并且基于WindowAssigner切分窗口的数据流。所以WindowedStream都是从KeyedStream衍生而来的。而在WindowedStream上进行任何transformation也都将转变回DataStream。
-
-```scala
-val stream: DataStream[MyType] = env.addSource(new FlinkKafkaConsumer08[String](...))
-val str1: DataStream[(String, MyType)] = stream.flatMap { ... }
-val str2: DataStream[(String, MyType)] = stream.rebalance()
-val str3: DataStream[AnotherType] = stream.map { ... }
-```
-
-上述 WindowedStream 的样例代码在运行时会转换成如下的执行图：
-
-![img](./images/datastream-window-example.png)
-
-​		Flink 的窗口实现中会将到达的数据缓存在对应的窗口buffer中（一个数据可能会对应多个窗口）。当到达窗口发送的条件时（由Trigger控制），Flink 会对整个窗口中的数据进行处理。Flink 在聚合类窗口有一定的优化，即不会保存窗口中的所有值，而是每到一个元素执行一次聚合函数，最终只保存一份数据即可。
-
-​		在key分组的流上进行窗口切分是比较常用的场景，也能够很好地并行化（不同的key上的窗口聚合可以分配到不同的task去处理）。不过有时候我们也需要在普通流上进行窗口的操作，这就是 `AllWindowedStream`。`AllWindowedStream`是直接在DataStream上进行`windowAll(...)`操作。`AllWindowedStream` 的实现是基于 `WindowedStream` 的（Flink 1.1.x 开始）。Flink 不推荐使用`AllWindowedStream`，因为在普通流上进行窗口操作，就势必需要将所有分区的流都汇集到单个的Task中，而这个单个的Task很显然就会成为整个Job的瓶颈。
-
-**<font color='red'>注意</font>**
-
-> 不推荐使用AllWindowedStream，因为AllWindowedStream在执行时并发度为1.
-
-### JoinedStreams **&** CoGroupedStreams
-
-​		双流 Join 也是一个非常常见的应用场景。深入源码你可以发现，JoinedStreams 和 CoGroupedStreams 的代码实现有80%是一模一样的，JoinedStreams 在底层又调用了 CoGroupedStreams 来实现 Join 功能。除了名字不一样，一开始很难将它们区分开来，而且为什么要提供两个功能类似的接口呢？？
-
-​		实际上这两者还是很点区别的。首先 co-group 侧重的是group，是对同一个key上的两组集合进行操作，而 join 侧重的是pair，是对同一个key上的每对元素进行操作。co-group 比 join 更通用一些，因为 join 只是 co-group 的一个特例，所以 join 是可以基于 co-group 来实现的（当然有优化的空间）。而在 co-group 之外又提供了 join 接口是因为用户更熟悉 join（源于数据库吧），而且能够跟 DataSet API 保持一致，降低用户的学习成本。
-
-​		JoinedStreams 和 CoGroupedStreams 是基于 Window 上实现的，所以 CoGroupedStreams 最终又调用了 WindowedStream 来实现。
-
-```scala
-val firstInput: DataStream[MyType] = ...
-val secondInput: DataStream[AnotherType] = ...
-
-val result: DataStream[(MyType, AnotherType)] = firstInput.join(secondInput)
-    .where("userId").equalTo("id")
-    .window(TumblingEventTimeWindows.of(Time.seconds(3)))
-    .apply (new JoinFunction () {...})
-```
-上述 JoinedStreams 的样例代码在运行时会转换成如下的执行图：
-
-![img](./images/datastream-join&group-example.png)
-
-​		双流上的数据在同一个key的会被分别分配到同一个window窗口的左右两个篮子里，当window结束的时候，会对左右篮子进行笛卡尔积从而得到每一对pair，对每一对pair应用 JoinFunction。不过目前（Flink 1.1.x）JoinedStreams 只是简单地实现了流上的join操作而已，距离真正的生产使用还是有些距离。因为目前 join 窗口的双流数据都是被缓存在内存中的，也就是说如果某个key上的窗口数据太多就会导致 JVM OOM（然而数据倾斜是常态）。双流join的难点也正是在这里，这也是社区后面对 join 操作的优化方向，例如可以借鉴Flink在批处理join中的优化方案，也可以用ManagedMemory来管理窗口中的数据，并当**数据超过阈值时能spill到硬盘**。
-
-### ConnectedStreams
-
-​		在 DataStream 上有一个 union 的转换 dataStream.union(otherStream1, otherStream2, …)，用来合并多个流，新的流会包含所有流中的数据。union 有一个限制，就是所有合并的流的类型必须是一致的。ConnectedStreams 提供了和 union 类似的功能，用来连接两个流，但是与 union 转换有以下几个区别：
-
-- ConnectedStreams 只能连接两个流，而 union 可以连接多于两个流。
-- ConnectedStreams 连接的两个流类型可以不一致，而 union 连接的流的类型必须一致。
-- ConnectedStreams 会对两个流的数据应用不同的处理方法，并且双流之间可以共享状态。这在第一个流的输入会影响第二个流时, 会非常有用。
-
-​		如下 ConnectedStreams 的样例，连接 input 和 other 流，并在input流上应用map1方法，在other上应用map2方法，双流可以共享状态（比如计数）。
-
-```scala
-val input: DataStream[MyType] = ...
-val other: DataStream[AnotherType] = ...
-
-val connected: ConnectedStreams[MyType, AnotherType] = input.connect(other)
-
-val result: DataStream[ResultType] = 
-        connected.map(new CoMapFunction[MyType, AnotherType, ResultType]() {
-            override def map1(value: MyType): ResultType = { ... }
-            override def map2(value: AnotherType): ResultType = { ... }
-        })
-```
-
-当并行度为2时，其执行图如下所示：
-
-![img](./images/datastream-connect-example.png)
-
-## 数据流元素的类型
-
-![1563856676898](images/1563856676898.png)
-
-`StreamElement`是Flink中数据流的单个元素的抽象，包含了4中类型的`StreamElement`，如下。
-
-
-
-**StreamRecord**
-
-`StreamRecord`表示数据流中的一条记录（或者叫做一个事件），包含如下内容：
-
-- 数据的值本身
-- 事件戳（可选）
-
-**LatencyMarker**
-
-特殊的类型StreamRecord，携带如下信息：
-
-- ​	携带一个从source被创造出来的时间戳
-- ​	vertexId
-- ​	source operator的subtask index.
-
-在sink中，使用LatencyMarker可以估计数据在整个DAG图中流转花费的时间，用来近似的评估延时。
-
-**Watermark**
-
-Watermark是一个时间戳，用来告诉Operator，所有时间 <= Watermark的事件或记录都已经处理完毕，不会再有比Watermark更早的记录，Operator可以根据watermark 触发window的计算、清理资源等等。后边有详细介绍。
-
-**StreamStatus**
-
-`StreamStatus`可以表示两种状态：
-
-- **IDLE**
-- **ACTIVE**
-
-用来告诉Stream Task是否会继续接收到上游的记录或者Watermark。`StreamStatus`在Source Operator中生成，向下游沿着DAG传播。
-
-当`SourceStreamTask`或一般的`StreamTask`处于闲置状态（IDLE），不会向下游发送数据或者Watermark的时候，就向下游发送`StreamStatus#IDLE`状态告知下游，依次向下传递。当恢复向下游发送数据或者WaterMark前，首先发送`StreamStatus#ACTIVE`状态告知下游。
-
-
-
-**如何判断是Idle还是Active状态？**
-
-- 对于Source Task，如果读取不到输入数据，则认为是Idle状态，例如，Kafka Consumer未被赋予partition。如果重新读取到数据了，则认为是Active状态。
-- 当StreamTask的所有SourceTask **全部** 处于**Idle**状态的时候认为这个StreamTask处于IDEL状态，只要有一个上游的Source Task是**Active**状态，StreamTask就是**Active**状态。
-
-**Stream Status如何影响Watermark？**
-
-由于SourceTask保证在**Idle**状态和**Active**状态之间不会发生数据元素，所以StreamTask可以在不需要检查当前的状态的情况下安全的处理和传播收到数据元素。但是由于在DAG的任何中间节点都可能产生watermark，所以当前StreamTask在发送watermark之前必须检查当前Operator的状态,如果当前的状态是**Idle**,则watermark会被阻塞，不会向下游发送。
-
-如果StreamTask有多个上游输入，有两种情况：
-
-- 上游输入的Watermark状态为Idle
-- 恢复到Active状态，但是其Watermark落后于当前Operator的最小Watermark，此时需要忽略这一个特殊的Watermark。在判断是否需要向前推进Watermark和向下游发送的时候，这个特殊Watermark不起作用。
-
-> **注意**
->
-> 当Source通知下游SourceTask永久关闭，并且再也不会向下游发送数据的时候，会发送一个的值为`Watermark.MAX_WATERMARK`的watermark而不是一个`StreamStatus#IDLE`状态。
->
-> `StreamStatus`只是用作临时性的停止数据发送和恢复发送的情况。
 
 
 
@@ -3912,6 +5435,27 @@ DirectedOutput共享对象模式， CopyingDirectedOutput非共享对象模式�
 ## 数据交换
 
 ### 数据传递
+
+#### PULL VS PUSH模式
+
+在分布式计算过程中，不同计算节点之间传送数据，一般有**PULL**模式和**PUSH**模式两种选择。
+
+Flink Batch的计算模型采用**PULL**模式，与Spark类似，将计算过程分成多个阶段，上游完全计算完毕之后，下游从上游拉取数据开始下一阶段计算，知道最终所有的阶段都计算完毕，输出结果，Batch Job结束退出。
+
+Flink Stream的计算模型采用的是**PUSH**模式，上游主动向下游推送数据，上下游之间采用生产者-消费者模式，下游收到数据触发计算，没有数据则进入等待状态。
+
+> **PUSH**模式的数据处理过程叫做pipeline。
+
+|              | Pull                               | Push                                           |
+| :----------- | :--------------------------------- | :--------------------------------------------- |
+| **延迟**     | 延迟高（需要等待上游所有计算完毕） | 低延迟（上游边计算边向下游输出）               |
+| **下游状态** | 有状态，需要知道何时拉取           | 无状态                                         |
+| **上游状态** | 无状态                             | 有状态，需要了解每个下游的推送点               |
+| **连接状态** | 短连接                             | 长连接                                         |
+| **难点**     | 实时性和流量的取舍                 | 下游能力和push能力不匹配问题，需要通过反压解决 |
+| **优点**     | 容错简单                           | 容错比较复杂                                   |
+
+
 
 #### 数据传递的方式
 
@@ -9099,7 +10643,7 @@ val JOIN_REORDER_RULES: RuleSet = RuleSets.ofList(
 
 #### 为什么要代码生成？
 
-此时需要从一篇论文说起《[Volcano-An Extensible and Parallel Query Evaluation System](http://daslab.seas.harvard.edu/reading-group/papers/volcano.pdf)》，此轮为 Goetz Graefe 在 1994 年提出的。论文中的重点是扩展性和并行性。
+此时需要从一篇论文说起《[Volcano-An Extensible and Parallel Query Evaluation System](http://daslab.seas.harvard.edu/reading-group/papers/volcano.pdf)》，此论文是 Goetz Graefe 在 1994 年提出的。论文中的重点是**扩展性**和**并行性**。
 
 **扩展性**是说抽象模型到适应各种不同的数据库，易于扩展支持不同的数据类型、算法和算子。
 
@@ -9125,41 +10669,153 @@ Volcano模型的优点是抽象起来很简单，实现简单，可以通过任�
 
 #### flink中的代码生成
 
+代码生成简单来讲，就是用字符串拼装一个类出来，其效果等同于手写代码，在内存中编译成Java字节码执行。
+
+上边介绍了Flink为什么要代码生成，接下来介绍Flink代码生成的逻辑。
+
+###### 代码生成的总体逻辑
+
+首先在Flink中，1.9版本（Blink代码合并进来）之前，Flink Table & SQL的生成的底层翻译成对`DataStream API`的调用，在1.9版本之后，直接生成`Transformation`，然后走生成图的流程开始执行。
+
+代码片段分为两部分生成：calcite 生成和flink生成，Calcite生成RexNode的代码，然后有Flink将Calcite生成的片段拼装成类代码。
+
+Flink提供了如下类型的代码生成器，生成不同SQL运算的代码。
+
+- **ExprCodeGenerator**
+
+  用来生成表达式（`Calcite RexNode`）计算的Java代码，同时也支持生成返回结果类型转换的代码。
+
+- **ProjectCodeGenerator**
+
+  生成Project的代码。
+
+- **SinkCodeGenerator**
+
+  主要是将flink内部的Row类型转换成写入外部存储需要的数据结构。
+
+- **ValuesCodeGenerator**
+
+- **SortCodeGenerator**
+
+  生成`NormalizedKeyComputer`和`RecordComparator`。
+
+- **ComparatorCodeGenerator**
+
+- **CalcCodeGenerator**
+
+  生成一般运算的代码，例如filter。
+
+- **CollectorCodeGenerator**
+
+- **CorrelateCodeGenerator**
+
+- **EqualiserCodeGenerator**
+
+- **ExpandCodeGenerator**
+
+  
+
+- **HashCodeGenerator**
+
+  根据选择的字段，生成BaseRow的hash code。
+
+- **InputFormatCodeGenerator**
+
+- **LongHashJoinGenerator**
+
+- **LookupJoinCodeGenerator**
+
+  生成异步lookup的函数调用。
+
+- **MatchCodeGenerator**
+
+  生成Flink CEP相关的代码。
+
+  聚合生成规则如下：
+
+  1. 所有的聚合运算（RexCall）按照子pattern进行分组。
+  2. 相同的聚合运算（aggregation），如果在一个表达式出现了多次，也只会被生成一次。例如`SUM(A.price) > SUM(A.price) + 1)`，`SUM(A.price)`只会被生成一次，然后会被复用。
+  3. 所有的表达式的代码生成完毕之后（在`generateCondition`或`generateOneRowPerMatchExpression`中），会生成`GeneratedFunction`：
+     - `GeneratedFunction`作为内部类被使用；
+     - `GeneratedFunction`由其包装类初始化、打开、关闭；
+     - 生成将计算输入Row转换为聚合运算所需要的Row的函数；
+     - 生成计算聚合值的函数；
+
+###### 代码生成的过程（待继续）
+
+**入口**
+
+代码生成的入口位于Flink 物理计划的每个`StreamExecXXX`类中，如下例：
+
+```scala
+//普通Table与用户自定义Table Function Join
+class StreamExecCorrelate(
+    cluster: RelOptCluster,
+    traitSet: RelTraitSet,
+    inputRel: RelNode,
+    val projectProgram: Option[RexProgram],
+    scan: FlinkLogicalTableFunctionScan,
+    condition: Option[RexNode],
+    outputRowType: RelDataType,
+    joinType: JoinRelType)
+  extends SingleRel(cluster, traitSet, inputRel)
+  with StreamPhysicalRel
+  with StreamExecNode[BaseRow] {
+
+  ...
+  //具体SQL算子的代码生成的入口
+  override protected def translateToPlanInternal(
+      planner: StreamPlanner): Transformation[BaseRow] = {
+    val tableConfig = planner.getTableConfig
+    //获取上游的Transformation，为本次的Transformation提供输入数据类型等元数据
+    val inputTransformation = getInputNodes.get(0).translateToPlan(planner)
+      .asInstanceOf[Transformation[BaseRow]]
+    val operatorCtx = CodeGeneratorContext(tableConfig)
+      .setOperatorBaseClass(classOf[AbstractProcessStreamOperator[_]])
+    //生成Transformation
+    val transform = CorrelateCodeGenerator.generateCorrelateTransformation(
+      tableConfig,
+      operatorCtx,
+      inputTransformation,
+      inputRel.getRowType,
+      projectProgram,
+      scan,
+      condition,
+      outputRowType,
+      joinType,
+      getResource.getParallelism,
+      retainHeader = true,
+      getExpressionString,
+      "StreamExecCorrelate")
+    if (getResource.getMaxParallelism > 0) {
+      transform.setMaxParallelism(getResource.getMaxParallelism)
+    }
+    //返回生成的Transformation
+    transform
+  }
+}
+```
 
 
-代码生成分为calcite提供的代码片段生成和flink提供的代码片段生成，两者组合完成sql的完整功能。
 
-**ProjectCodeGenerator**
+**代码生成的核心逻辑**
 
-**SinkCodeGenerator**
+代码生成的主要内容如下：
 
-**ValuesCodeGenerator**
+1. 生成StreamOperatorFactory，包含类名、实现接口、Operator的方法代码块的生成。
 
-**SortCodeGenerator**
+2. 生成处理逻辑部分，`public void processElement()`的核心代码
 
-**ComparatorCodeGenerator**
+3. 生成Collector
 
-**CalcCodeGenerator**
+4. 生成Projection（如果有必要）
+5. 
 
-**CollectorCodeGenerator**
+```
 
-**CorrelateCodeGenerator**
+```
 
-**EqualiserCodeGenerator**
 
-**ExpandCodeGenerator**
-
-**ExprCodeGenerator**
-
-**HashCodeGenerator**
-
-**InputFormatCodeGenerator**
-
-**LongHashJoinGenerator**
-
-**LookupJoinCodeGenerator**
-
-**MatchCodeGenerator**
 
 ## 自定义函数（待完善）
 
@@ -9222,17 +10878,375 @@ Flink支持四种类型的自定义函数：
 
 
 
+
+
 # Flink背压（待编写）
 
 
 
-# Flink Metrics（待编写）
+# Flink Metrics（完善）
+
+## Flink监控信息的类型
+
+Flink 提供了`Counter`, `Gauge`, `Histogram` 和`Meter`4类监控信息。
+
+- **Counter**
+
+  计数器 ，用来统计一个metrics的总量。拿flink中的指标来举例，像Task/Operator中的numRecordsIn（此task或者operator接收到的record总量）和numRecordsOut（此task或者operator发送的record总量）就属于Counter。
+
+- **Gauge**
+
+  单个指标值  ， 用来记录一个metrics的瞬间值。以flink中的指标举例，像JobManager或者TaskManager中的JVM.Heap.Used就属于Gauge，记录某个时刻JobManager或者TaskManager所在机器的JVM堆使用量。
+
+- **Histogram**
+
+  直方图， metrics的总量或者瞬时值都是比较单一的指标，当想得到metrics的最大值，最小值，中位数等统计信息时，需要用到Histogram。
+
+  Flink中属于Histogram的指标很少，但是最重要的一个是属于operator的latency。此项指标会记录数据处理的延迟信息，对任务监控起到很重要的作用。
+
+- **Meter**
+
+  平均值， 用来记录一个metrics某个时间段内平均值。
+
+  Flink中类似指标有task/operator中的numRecordsInPerSecond，此task或者operator每秒接收的记录数。
+
+## 监控域
+
+## 域的概念
+
+Flink的指标体系是一个树形结构，Scope相当于树上的顶层分支，表示指标的大的分类。
+
+每个指标被分配一个标识符，该标识符将基于3个组件进行汇报：注册指标时用户提供的名称，可选的用户自定义域和系统提供的域。例如，如果`A.B`是系统域，`C.D`是用户Scope，`E`是名称，那么指标的标识符将是`A.B.C.D.E`. 可以通过设置`conf/flink-conf.yam`里面的`metrics.scope.delimiter`参数来配置标识符的分隔符（默认:`.`）。
+
+### 用户域
+
+调用`MetricGroup#addGroup(String name)`和`MetricGroup#addGroup(int name)`来定义一个用户域
+
+```java
+counter = getRuntimeContext()
+  .getMetricGroup()
+  .addGroup("MyMetrics")
+  .counter("myCounter");
+
+counter = getRuntimeContext()
+  .getMetricGroup()
+  .addGroup("MyMetricsKey", "MyMetricsValue")
+  .counter("myCounter");
+```
+
+### 系统域
+
+系统域包含关于这个指标的上下文信息，例如其注册的任务或该任务属于哪个Job。
+
+可以通过在`conf/flink-conf.yaml`中设置以下key来设置上下文信息。这些key中可以包含常量字符串（例如:“taskmanager”）和运行运行时被替换的宏变量（例如:”<task_id>“）。
+
+- **metrics.scope.jm**
+  - 默认： `<host>.jobmanager`
+  - 适用于属于一个JobManager的所有指标.
+- **metrics.scope.jm.job**
+  - 默认： `<host>.jobmanager.<job_name>`
+  - 适用于属于一个JobManager和job的所有指标.
+- **metrics.scope.tm**
+  - 默认： `<host>.taskmanager.<tm_id>`
+  - 适用于属于一个TaskManager的所有指标.
+- **metrics.scope.tm.job**
+  - 默认： `<host>.taskmanager.<tm_id>.<job_name>`
+  - 适用于属于一个task manager和job的所有指标.
+- **metrics.scope.task**
+  - 默认：`<host>.taskmanager.<tm_id>.<job_name>.<task_name>.<subtask_index>`
+  - 适用于属于一个task的所有指标.
+- **metrics.scope.operator**
+  - 默认：`<host>.taskmanager.<tm_id>.<job_name>.<operator_name>.<subtask_index>`
+  - 适用于属于一个operator的所有指标。
+
+**使用域和变量**
+
+在使用域和变量的时候，对变量的数量和顺序没有限制，但是变量区分大小写。
+
+`Operator`指标的默认域将标识符形式如下：
+
+`localhost.taskmanager.1234.MyJob.MyOperator.0.MyMetric`
+
+**自定义示例**
+
+假设想包含任务名称，但省略TaskManager的信息，可以指定如下格式：
+
+`metrics.scope.operator: <host>.<job_name>.<task_name>.<operator_name>.<subtask_index>`
+
+这可以创建标识符`localhost.MyJob.MySource_->_MyOperator.MyOperator.0.MyMetric`.
+
+> **注意**
+>
+> 对于此格式的字符串，如果同一作业同时运行多次，则可能会发生标识符冲突，导致指标标准数据不一致.因此，建议使用ID（例如 <job_id>）来区分不同的作业，或者为作业和操作符分配唯一的名称来保证一定程度上的唯一性.
+
+### 可用变量列表
+
+- **JobManager**: `<host>`
+- **TaskManager**: `<host>`，`<tm_id>`
+- **Job**: `<job_id>`，`<job_name>`
+- **Task**: `<task_id>`，`<task_name>`，`<task_attempt_id>`，`<task_attempt_num>`，`<subtask_index>`
+- **Operator**: `<operator_name>`，`<subtask_index>`
+
+## 监控指标上报
+
+Flink内置了JMX、Graphite、InfluxDB、Prometheus 、PrometheusPushGateway、StatsD、Datadog、Slf4j共8种监控指标上报机制。
+
+配置方法参加官方文档《[官方文档](https://ci.apache.org/projects/flink/flink-docs-release-1.8/monitoring/metrics.html#reporter)》。
+
+##  监控指标项清单
+
+### CPU
+
+|        Scope         | 指标分类       | 指标 | 说明                 | 类型  |
+| :------------------: | :------------- | :--- | :------------------- | :---- |
+| **Job-/TaskManager** | Status.JVM.CPU | Load | 近期JVM的CPU使用情况 | Gauge |
+|                      |                | Time | JVM使用的CPU时间     | Gauge |
+
+### Memory
+
+|        Scope         | 指标分类          | 指标                 | 描述                                                         | 类型  |
+| :------------------: | :---------------- | :------------------- | :----------------------------------------------------------- | :---- |
+| **Job-/TaskManager** | Status.JVM.Memory | Heap.Used            | 当前时刻使用的堆内存大小（单位byte)                          | Gauge |
+|                      |                   | Heap.Committed       | 保证JVM可用的堆内存大小，单位是byte                          | Gauge |
+|                      |                   | Heap.Max             | 可用的最大堆内存（单位byte）                                 | Gauge |
+|                      |                   | NonHeap.Used         | 当前使用的堆外内存的大小（单位byte）                         | Gauge |
+|                      |                   | NonHeap.Committed    | 保证JVM可用的堆外内存大小，单位是byte。                      | Gauge |
+|                      |                   | NonHeap.Max          | 最大可用堆外内存，单位是byte                                 | Gauge |
+|                      |                   | Direct.Count         | 堆外内存缓冲池中缓冲区(Buffer)个数                           | Gauge |
+|                      |                   | Direct.MemoryUsed    | JVM使用的堆外内存缓冲池的大小，单位是byte。The amount of memory used by the JVM for the direct buffer pool (in bytes). | Gauge |
+|                      |                   | Direct.TotalCapacity | 堆外内存缓冲池的总容量，单位是byte。The total capacity of all buffers in the direct buffer pool (in bytes). | Gauge |
+|                      |                   | Mapped.Count         | 映射缓冲池中缓冲区（buffer）的数量                           | Gauge |
+|                      |                   | Mapped.MemoryUsed    | 映射缓冲池内存使用的大小，单位是byte。                       | Gauge |
+|                      |                   | Mapped.TotalCapacity | 映射缓冲池中总容量，单位是byte。                             | Gauge |
+
+### 线程
+
+|        Scope         | 指标分类           | 指标  | 说明         | 类型  |
+| :------------------: | :----------------- | :---- | :----------- | :---- |
+| **Job-/TaskManager** | Status.JVM.Threads | Count | 活动线程数量 | Gauge |
+
+### 垃圾回收
+
+|        Scope         | 指标分类                    | 指标                     | 说明                     | 类型  |
+| :------------------: | :-------------------------- | :----------------------- | :----------------------- | :---- |
+| **Job-/TaskManager** | Status.JVM.GarbageCollector | <GarbageCollector>.Count | 垃圾回收的总次数         | Gauge |
+|                      |                             | <GarbageCollector>.Time  | 执行垃圾回收花费的总时间 | Gauge |
+
+### 类加载器
+
+|        Scope         | 指标分类               | 指标            | 说明                        | 类型  |
+| :------------------: | :--------------------- | :-------------- | :-------------------------- | :---- |
+| **Job-/TaskManager** | Status.JVM.ClassLoader | ClassesLoaded   | 从JVM启动开始加载的类的总数 | Gauge |
+|                      |                        | ClassesUnloaded | 从JVM启动开始卸载的类的总数 | Gauge |
+
+### 网络
+
+|      Scope      | 指标分类                                                     | 指标                    | 说明                                 | 指标类型 |
+| :-------------: | :----------------------------------------------------------- | :---------------------- | :----------------------------------- | :------- |
+| **TaskManager** | Status.Network                                               | AvailableMemorySegments | 可用的内存片段总数                   | Gauge    |
+|                 |                                                              | TotalMemorySegments     | 申请的内存片段总数                   | Gauge    |
+|      Task       | buffers                                                      | inputQueueLength        | 输入缓冲区队列长度                   | Gauge    |
+|                 |                                                              | outputQueueLength       | 输出缓冲区队列长度                   | Gauge    |
+|                 |                                                              | inPoolUsage             | 估算输入缓冲区使用情况               | Gauge    |
+|                 |                                                              | outPoolUsage            | 估算输出缓冲区使用情况               | Gauge    |
+|                 | Network.<Input\|Output>.<gate> (taskmanager.net.detailed-metrics<br />设置为True有效) | totalQueueLen           | 所有输入输出通道中队列缓冲区总数     | Gauge    |
+|                 |                                                              | minQueueLen             | 所有输入输出通道中队列缓冲区最小数量 | Gauge    |
+|                 |                                                              | maxQueueLen             | 所有输入输出通道中队列缓冲区最大数量 | Gauge    |
+|                 |                                                              | avgQueueLen             | 所有输入输出通道中队列缓冲区平均数量 | Gauge    |
+
+### Cluster
+
+|     Scope      | 指标                      | 说明                                | 指标类型 |
+| :------------: | :------------------------ | :---------------------------------- | :------- |
+| **JobManager** | numRegisteredTaskManagers | 注册到JM的TM数量                    | Gauge    |
+|                | numRunningJobs            | 正在运行的Job数量                   | Gauge    |
+|                | taskSlotsAvailable        | The number of available task slots. | Gauge    |
+|                | taskSlotsTotal            | The total number of task slots.     | Gauge    |
+
+### Availability
+
+|             Scope              | 指标           | 说明                                                         | 指标 类型 |
+| :----------------------------: | :------------- | :----------------------------------------------------------- | :-------- |
+| **Job<br /> (仅限JobManager)** | restartingTime | Job重启花费的时长，如果Job正在重启，则该指标表示本次重启已经花费了多久了，单位是ms。 | Gauge     |
+|                                | uptime         | 自Job启动以来，无间断运行时长。已经完成的Job，返回-1。单位ms。 | Gauge     |
+|                                | downtime       | 如果该Job当前处于Faling或Recovery状态，Job非正常运行的时长。正在运行的Job返回0，完成的Job返回-1。单位ms。 | Gauge     |
+|                                | fullRestarts   | Job发布以来重启的总次数。                                    | Gauge     |
+
+### Checkpointing
+
+|           Scope           | 指标                            | 说明                                                         | 指标类型 |
+| :-----------------------: | :------------------------------ | :----------------------------------------------------------- | :------- |
+| **Job (仅限 JobManager)** | lastCheckpointDuration          | 完成上一次检测点所花费的时间，单位ms。                       | Gauge    |
+|                           | lastCheckpointSize              | 上一次检查点的总大小，单位byte。                             | Gauge    |
+|                           | lastCheckpointExternalPath      | 上一次外部检查点保存的路径。                                 | Gauge    |
+|                           | lastCheckpointRestoreTimestamp  | 上一次检查点恢复的事件，以CheckpointCoordinator的系统时间戳为准） | Gauge    |
+|                           | lastCheckpointAlignmentBuffered | 上一次检查点Barrier对齐过程中，所有subtask缓存的数据的总大小，单位byte。 | Gauge    |
+|                           | numberOfInProgressCheckpoints   | 正在执行过程中的检查点的数量。                               | Gauge    |
+|                           | numberOfCompletedCheckpoints    | 成功完成的保存点的数量。                                     | Gauge    |
+|                           | numberOfFailedCheckpoints       | 失败的检查点的数量。                                         | Gauge    |
+|                           | totalNumberOfCheckpoints        | 执行过的检查点的总数，包含正在进行的、完成的和失败的。       | Gauge    |
+|           Task            | checkpointAlignmentTime         | 上一次Barrier对齐所花费的总时间，如果当前正在执行，则是当前Barrier对齐已经花费是时长。单位纳秒。 | Gauge    |
+
+### RocksDB
+
+Certain RocksDB native metrics are available but disabled by default, you can find full documentation [here](https://ci.apache.org/projects/flink/flink-docs-release-1.8/ops/config.html#rocksdb-native-metrics)
+
+### IO
+
+|           Scope           | 指标                                                         | 说明                                                         | 指标类型  |
+| :-----------------------: | :----------------------------------------------------------- | :----------------------------------------------------------- | :-------- |
+| **Job（仅限TaskManager)** | [<source_id>.[<source_subtask_index>.]]<operator_id>.<operator_subtask_index>.latency | The latency distributions from a given source (subtask) to an operator subtask (in milliseconds), depending on the [latency granularity](//ci.apache.org/projects/flink/flink-docs-release-1.8/ops/config.html#metrics-latency-granularity). | Histogram |
+|         **Task**          | numBytesInLocal                                              | task从本地source读取的数据总量，单位是byte。                 | Counter   |
+|                           | numBytesInLocalPerSecond                                     | task从本地source读取数据的速率，单位是byte/s。               | Meter     |
+|                           | numBytesInRemote                                             | task从远程source读取的数据总量，单位是byte。                 | Counter   |
+|                           | numBytesInRemotePerSecond                                    | task从远程source读取数据的速率，单位是byte/s。               | Meter     |
+|                           | numBuffersInLocal                                            | task从本地Source读取的网络缓冲区（Buffer）总数。             | Counter   |
+|                           | numBuffersInLocalPerSecond                                   | task从本地Source读取的网络缓冲区（Buffer）速率，单位 个/s    | Meter     |
+|                           | numBuffersInRemote                                           | task从远程Source读取的网络缓冲区（Buffer）总数。             | Counter   |
+|                           | numBuffersInRemotePerSecond                                  | task从远程Source读取的网络缓冲区（Buffer）速率，单位 个/s    | Meter     |
+|                           | numBytesOut                                                  | task向外发送的数据总量，单位byte                             | Counter   |
+|                           | numBytesOutPerSecond                                         | task向外发送数据速率，单位bype/s                             | Meter     |
+|                           | numBuffersOut                                                | task向外发送的网络缓冲区(Buffer)个数                         | Counter   |
+|                           | numBuffersOutPerSecond                                       | task向外发送网络缓冲区速率，单位 个/s                        | Meter     |
+|     **Task/Operator**     | numRecordsIn                                                 | task/operator接收到的记录总数                                | Counter   |
+|                           | numRecordsInPerSecond                                        | task/operator接收记录速率，单位 个/s                         | Meter     |
+|                           | numRecordsOut                                                | task/operator对外发送的记录总数                              | Counter   |
+|                           | numRecordsOutPerSecond                                       | task/operator堆外发送记录速率，单位 个/s                     | Meter     |
+|                           | numLateRecordsDropped                                        | task/operator丢弃的迟到记录总数。                            | Counter   |
+|                           | currentInputWatermark                                        | 收到的最后一次输入Watermark，单位ms。<br />如果是双流输入，该值是`Min（input1Watermark，input2Watermark）`。 | Gauge     |
+|       **Operator**        | currentInput1Watermark                                       | 收到的第1个输入流的最后一次Watermark，单位为ms。**注意**：仅限于双流Operator。 | Gauge     |
+|                           | currentInput2Watermark                                       | 收到的第2个输入流的最后一次Watermark，单位为ms。**注意**：仅限于双流Operator。 | Gauge     |
+|                           | currentOutputWatermark                                       | 该Operator的最后一次输出Watermark，单位ms。                  | Gauge     |
+|                           | numSplitsProcessed                                           | 处理的InputSplit总数（仅限于数据源类型的Operator）           | Gauge     |
+
+### Connectors
+
+#### Kafka Connectors
+
+|  Scope   | 指标             | 用户变量         | 说明                                                         | 类型    |
+| :------: | :--------------- | :--------------- | :----------------------------------------------------------- | :------ |
+| Operator | commitsSucceeded | n/a              | The total number of successful offset commits to Kafka, if offset committing is turned on and checkpointing is enabled. | Counter |
+| Operator | commitsFailed    | n/a              | The total number of offset commit failures to Kafka, if offset committing is turned on and checkpointing is enabled. Note that committing offsets back to Kafka is only a means to expose consumer progress, so a commit failure does not affect the integrity of Flink's checkpointed partition offsets. | Counter |
+| Operator | committedOffsets | topic, partition | The last successfully committed offsets to Kafka, for each partition. A particular partition's metric can be specified by topic name and partition id. | Gauge   |
+| Operator | currentOffsets   | topic, partition | The consumer's current read offset, for each partition. A particular partition's metric can be specified by topic name and partition id. | Gauge   |
+
+#### Kinesis Connectors
+
+|  Scope   | 指标                               | 用户变量        | 说明                                                         | 指标类型 |
+| :------: | :--------------------------------- | :-------------- | :----------------------------------------------------------- | :------- |
+| Operator | millisBehindLatest                 | stream, shardId | The number of milliseconds the consumer is behind the head of the stream, indicating how far behind current time the consumer is, for each Kinesis shard. A particular shard's metric can be specified by stream name and shard id. A value of 0 indicates record processing is caught up, and there are no new records to process at this moment. A value of -1 indicates that there is no reported value for the metric, yet. | Gauge    |
+| Operator | sleepTimeMillis                    | stream, shardId | The number of milliseconds the consumer spends sleeping before fetching records from Kinesis. A particular shard's metric can be specified by stream name and shard id. | Gauge    |
+| Operator | maxNumberOfRecordsPerFetch         | stream, shardId | The maximum number of records requested by the consumer in a single getRecords call to Kinesis. If ConsumerConfigConstants.SHARD_USE_ADAPTIVE_READS is set to true, this value is adaptively calculated to maximize the 2 Mbps read limits from Kinesis. | Gauge    |
+| Operator | numberOfAggregatedRecordsPerFetch  | stream, shardId | The number of aggregated Kinesis records fetched by the consumer in a single getRecords call to Kinesis. | Gauge    |
+| Operator | numberOfDeggregatedRecordsPerFetch | stream, shardId | The number of deaggregated Kinesis records fetched by the consumer in a single getRecords call to Kinesis. | Gauge    |
+| Operator | averageRecordSizeBytes             | stream, shardId | The average size of a Kinesis record in bytes, fetched by the consumer in a single getRecords call. | Gauge    |
+| Operator | runLoopTimeNanos                   | stream, shardId | The actual time taken, in nanoseconds, by the consumer in the run loop. | Gauge    |
+| Operator | loopFrequencyHz                    | stream, shardId | The number of calls to getRecords in one second.             | Gauge    |
+| Operator | bytesRequestedPerFetch             | stream, shardId | The bytes requested (2 Mbps / loopFrequencyHz) in a single call to getRecords. | Gauge    |
+
+### 系统资源
+
+系统资源上报默认是禁用的。启用 `metrics.system-resource`之后，JobManager和TaskManager上的操作系统的CPU、内存、网络的监控指标可以上报给监控系统。采集间隔使用`metrics.system-resource-probing-interval`配置，指标是该间隔内的平均值。
+
+系统资源监控需要依赖额外的库，需要将如下jar文件放置到Flink的`lib`或者`opt`目录：
+
+- `com.github.oshi:oshi-core:3.4.0` (EPL 1.0 许可)
+
+以及oshi的依赖：
+
+- `net.java.dev.jna:jna-platform:jar:4.2.2`
+- `net.java.dev.jna:jna:jar:4.2.2`
+
+如果缺少这些Jar包，Flink启动时会报 `NoClassDefFoundError`。
+
+#### 操作系统CPU
+
+|        Scope         | 指标分类   | 指标      | 说明                                                         |
+| :------------------: | :--------- | :-------- | :----------------------------------------------------------- |
+| **Job-/TaskManager** | System.CPU | Usage     | 总体CPU使用率，单位%                                         |
+|                      |            | Idle      | CPU除去等待磁盘IO操作外的因为任何<br />原因而空闲的时间闲置时间，单位% |
+|                      |            | Sys       | 内核态CPU使用时间占比，单位%                                 |
+|                      |            | User      | 用户态CPU使用时间占比，单位%                                 |
+|                      |            | IOWait    | IOWait CPU使用率，单位%                                      |
+|                      |            | Irq       | 硬中断CPU中断时间占比，单位%                                 |
+|                      |            | SoftIrq   | 软中断CPU中断时间占比，单位%                                 |
+|                      |            | Nice      | nice值为负进程的CPU时间占比，单位%                           |
+|                      |            | Load1min  | 过去1分钟，CPU平均负载                                       |
+|                      |            | Load5min  | 过去5分钟，CPU平均负载                                       |
+|                      |            | Load15min | 过去15分钟，CPU平均负载                                      |
+|                      |            | UsageCPU* | 每个核的CPU使用率，单位                                      |
+
+#### 操作系统内存
+
+|        Scope         | 指标分类      | 指标      | 说明                         |
+| :------------------: | :------------ | :-------- | :--------------------------- |
+| **Job-/TaskManager** | System.Memory | Available | 可用内存大小，单位byte       |
+|                      |               | Total     | 总内存大小，单位byte         |
+|                      | System.Swap   | Used      | 系统交换区使用大小，单位type |
+|                      |               | Total     | 系统交换区总大小，单位byte   |
+
+#### 操作系统网络
+
+|        Scope         | 前缀                          | 指标        | 说明                     |
+| :------------------: | :---------------------------- | :---------- | :----------------------- |
+| **Job-/TaskManager** | System.Network.INTERFACE_NAME | ReceiveRate | 平均接收速率，单位byte/s |
+|                      |                               | SendRate    | 平均发送速率，单位byte/s |
+
+## Latency tracking
+
+Flink允许去跟踪条目在整个系统中运行的延迟，为了开启延迟跟踪，`latencyTrackingInterval `(毫秒)必须在`ExecutionConfig`中设置为一个正值. 在`latencyTrackingInterval`，源端将周期性的发送一个特殊条目，叫做`LatencyMarker`，这个标记包含一个从源端发出记录时的时间戳。延迟标记不能超过常规的用户条目，因此如果条目在一个操作的前面排队，将会通过这个标记添加延迟跟踪.
+
+请注意延迟标记不记录用户条目在操作中所花费的时间，而是绕过它们。特别是这个标记是不用于记录在窗口缓冲区中的时间条目。只有当操作不能够接受新的条目时，它们才会排队,用这个标记测量的延迟将会反映出这一点.
+
+所有中间操作通过保留每个源的最后`n`个延迟的列表，来计算一个延迟的分布。落地操作保留每个源的列表，然后每个并行源实例允许检测由单个机器所引起的延迟问题.
+
+目前，Flink认为集群中所有机器的时钟是同步的。我们建议建立一个自动时钟同步服务（类似于NTP），以避免虚假的延迟结果.
 
 
 
-# Flink部署（待编写）
+##  Metrics Rest API接口
 
-## 单机部署
-## StandAlone模式
-## Yarn模式
-## K8s模式
+
+
+## Web UI上监控指标的呈现
+
+
+
+## 自定义监控指标（待编写)
+
+
+
+# Flink 安全（待编写）
+
+
+
+# Flink性能调优（待编写）
+
+
+
+# Flink生产环境注意事项
+
+## 明确的设定并行度（待编写）
+
+
+
+## 设定Operator的UUID
+
+在State原理章节中，提到过Savepoint和Checkpoint，用户最好为每个Operator设定UID。在从savepoint恢复的时候，Flink使用UID进行快照和Job Operator之间的映射，同一个UID的快照内容，恢复到该UID的Operator中，如果UID改变了，就可能存在无法恢复、部分恢复，无法恢复意味着需要重新处理，部分恢复之后的数据处理结果是错的，无论哪一种都会导致处理结果的异常。
+
+## 选择合适的状态Backend
+
+目前，Flink Job在恢复的时候，不能不能从不同的StateBackend读取保存的保存点。例如，使用MemoryBackend保存了保存点savepoint，将job修改为使用RocksDB StateBackend，Job从保存点savepoint恢复。
+
+> Flink未来的计划中打算将不同的状态Backend统一起来，允许不同的State Backend相互兼容，但是目前还不行。
+
+一般来说，建议使用RocksdDB作为状态Backend，目前RocksDB是唯一支持超大状态的、异步、增量checkpoint的方式。FSStateBackend虽然也可以保存大状态，但是仍受限于TaskManager的内存容量，并且FSStateBackend不支持增量Checkpoint，有可能导致保存状态的花费太长的时间，导致状态保存失败。异步快照的好处是可以不阻塞Flink数据流，保持持续的数据处理，增大吞吐量。
+
+RockDB StateBackend支持大状态的代价是相比内存型的状态，性能会降低，对状态的读取和写入需要频繁的磁盘操作。如果可以确定不会超过内存的容量，保存快照的时候采用同步方式带来的数据流处理的阻断也不会有很大影响的情况下，可以考虑使用其他的StateBackend，如FSStateBackend。
+
+## 配置JobManager高可用
+
+JobManager在Flink集群中负责Job的调度执行和资源管理，是极其重要的组件。默认情况下JobManager是单点的，可能导致单点失败的问题（SPOF），JobManager组件不可用之后，无法发布新的Job并且所有的正在运行的作业也会出错。
+
+<font color=red>所以在生产环境强烈建议配置JobManager的高可用。</font>
+

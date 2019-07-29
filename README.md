@@ -10,3 +10,11 @@
 
 # [**流上的高效模式匹配**](/流上的高效模式匹配论文.md)
 Flink的CEP实现重度参考了论文《[Efficient Pattern Matching over Event Streams](https://people.cs.umass.edu/~immerman/pub/sase+sigmod08.pdf)》，此文是该论文核心部分的中文版。
+
+# [**Volcano-An Extensible and Parallel Query Evaluation System**](/papers/volcano.pdf)
+可扩展的并行查询系统模型，所有的SQL查询基本都参考过该论文。
+
+
+# [流计算SQL](/papers/One_SQL_to_Rule_Them_All.pdf)
+SIGMOD'19 Apache Beam/Calcite/Flink & 流式SQL
+
