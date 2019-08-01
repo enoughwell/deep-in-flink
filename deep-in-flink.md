@@ -4520,6 +4520,89 @@ ExecutionJobVertex方法，用来将一个个JobVertex封装成ExecutionJobVerte
 
 # Flink调度与资源管理
 
+## Job提交
+
+### 提交流程
+
+Flink在Yarn等资源管理平台上执行Job的时候，有两种模式：**会话模式**和**作业模式**，在Flink部署章节已经提到过，本节的目的是详细的介绍两种模式下Flink机制的过程和差异。
+
+在开始之前首先介绍一下Flink作业提交汇总涉及的几个角色：
+
+- **Client**
+
+- **Dispatcher**
+
+  Dispatcher是Flink在新版本的作业提交流程中设计的一个组件，用来接收Flink Client提交的Job的相关信息、持久化，作为集群管理者的角色启动JobManager，并且在异常的情况下重启JobManager。
+
+  > 在Yarn模式下，Dispatcher是可选的，在k8s模式下无法使用Dispatcher。（此处需要研究确定）
+
+- **ResourceManager**
+
+- **ApplicationMaster**
+
+- **TaskManager**
+
+
+
+#### 不同运行模式下的提交流程（待继续）
+
+**会话模式（WithDispatcher）**
+
+![1564651314626](images/1564651314626.png)
+
+​	会话模式下，首先会启动好Flink集群，ResourceManager、Dispatcher、JobManager、TM都启动完毕，其中TM的数量由用户启动Flink集群时指定，但是不一定会完全启动，Flink可以动态申请TM（Container）。
+
+1. Flink Client首先生成Graph，如果是流则生成StreamGraph，再生成JobGraph，如果是批，则直接生成JobGraph，并且进行初步的优化。
+2. Client通过Http接口将JobGraph和相关的Jar文件、配置文件提交给Dispatcher
+
+**作业模式（Without Dispatcher）**
+
+![1564651348392](images/1564651348392.png)
+
+#### 会话模式和作业模式的适用场景
+
+| 运行模式 | 适用场景                                                     |
+| -------- | ------------------------------------------------------------ |
+| 会话模式 | 共享Dispatcher和ResourceManager<br />共享资源<br />适合执行时间短，频繁执行的短任务<br /> |
+| 作业模式 | 独享Dispatcher和ResourceManager<br />按需申请资源<br />长周期执行的任务，集群异常影响范围小<br /> |
+
+
+
+### 资源管理
+
+ResourceManager是Flink集群的资源管理器，其作用如下：
+
+- 申请容器启动新的TM，或者为Job申请slot。
+
+- **Giving failure notifications** to JobManagers and TaskManagers
+
+- 缓存TaskManager(即容器），等待一段时间之后再释放掉不用的容器，避免资源反复的申请释放。
+- 
+
+**ResourceManager的体系**
+
+RsourceManager是资源管理的抽象类，其继承体系如下：![1564647289064](images/1564647289064.png)
+
+
+
+如上图所示，ResourceManager有3个实现类：
+
+- **YarnResourceManager**
+
+  Yarn资源管理器，用来对接Yarn，在yarn集群上启动和运行flink集群，能够实现动态的资源申请和释放。
+
+- **StandaloneReousrceManager**
+
+  Flink集群的自身的管理器，用于资源确定的部署模式下。其中使用k8s部署flink集群，也是使用了该资源管理器进行调度。
+
+- **MesosResourceManager**
+
+  Mesos资源管理器，用来对接Mesos，在Mesos上启动和运行Flink集群。
+
+
+
+### Job运行模式
+
 ## 调度
 
 ### 调度模式
@@ -12335,7 +12418,9 @@ public interface RpcGateway {
 - Dispatcher
 - JobMaster
 - ResourceManager
-- TaskExecutor。
+- TaskExecutor
+
+> 在上边的重要子类都使用了`RpcService`作为参数，用来启动RPC通讯服务，`RpcEndpoint`提供远程通讯特性，`RpcService`负责管理`RpcEndpoint`生命周期。
 
 **RpcEndpoint的关键属性**
 
@@ -12527,6 +12612,8 @@ class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, Rpc
 - 延迟/立刻调度Runnable、Callable。
 
 `RpcService`跟`RpcGateway`类似，也提供了获取地址和端口的方法。
+
+
 
 #### RpcService的关键属性
 
@@ -12895,7 +12982,13 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends AbstractActor {
 
 - **Fenced消息**
 
-  
+  Fenced消息用来防止集群的脑裂（brain split）问题，例如配置JobMaster HA，开始的时候JobMaster1作为Leader，JobMaser1宕掉，JobMaster2被选为Leader，此时如果JobMaster1恢复，可能会TM发送消息，TM必须有一种机制能够识别哪个是当前的JobMaster Leader，此时Fence token使用 JobMaster ID鉴别。每个TM向JM注册之后，都会拿到当前Leader  JM的id作为Fence token，其他的JM发送的消息因为其JM ID与期望的fence token不一样，就会被忽略掉。
+
+  在当前的实现中，JM、Dispatcher、ResourceManager实现了fence token机制。
+
+  `LocalFencedMessage`，本地Fence token消息，同一个JVM内的调用。
+
+  `RemoteFencedMessage`，远程fence token消息，包括本地不同JVM和跨节点的JVM调用。
 
 - **调用消息**
 
