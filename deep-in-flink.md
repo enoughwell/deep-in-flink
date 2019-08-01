@@ -4518,7 +4518,7 @@ ExecutionJobVertex方法，用来将一个个JobVertex封装成ExecutionJobVerte
 
 将`JobGraph`按照拓扑排序后得到一个`JobVertex`集合，遍历该`JobVertex`集合，即从`source`开始，将`JobVertex`封装成`ExecutionJobVertex`，并依次创建`ExecutionVertex`、`Execution`、`IntermediateResult`和`IntermediateResultPartition`。然后通过`ejv.connectToPredecessor()`方法，创建`ExecutionEdge`，建立当前节点与其上游节点之间的联系，即连接`ExecutionVertex`和`IntermediateResultPartition`。
 
-# Flink调度&执行
+# Flink调度与资源管理
 
 ## 调度
 
@@ -4593,7 +4593,8 @@ private CompletableFuture<Void> scheduleEager(SlotProvider slotProvider, final T
 	final boolean queued = allowQueuedScheduling;
 
 	// collecting all the slots may resize and fail in that operation without slots getting lost
-	final ArrayList<CompletableFuture<Execution>> allAllocationFutures = new ArrayList<>(getNumberOfExecutionJobVertices());
+	final ArrayList<CompletableFuture<Execution>> allAllocationFutures = 
+        new ArrayList<>(getNumberOfExecutionJobVertices());
 
 	final Set<AllocationID> allPreviousAllocationIds =
 		Collections.unmodifiableSet(computeAllPriorAllocationIdsIfRequiredByScheduling());
@@ -4613,7 +4614,8 @@ private CompletableFuture<Void> scheduleEager(SlotProvider slotProvider, final T
 
 	// this future is complete once all slot futures are complete.
 	// the future fails once one slot future fails.
-	final ConjunctFuture<Collection<Execution>> allAllocationsFuture = FutureUtils.combineAll(allAllocationFutures);
+	final ConjunctFuture<Collection<Execution>> allAllocationsFuture = 
+        FutureUtils.combineAll(allAllocationFutures);
 
 	return allAllocationsFuture.thenAccept(
 		(Collection<Execution> executionsToDeploy) -> {
@@ -4654,7 +4656,8 @@ private CompletableFuture<Void> scheduleEager(SlotProvider slotProvider, final T
 								executionMessageBuilder.append("incomplete: " + executionFuture);
 							}
 						} catch (CompletionException completionException) {
-							executionMessageBuilder.append("completed exceptionally: " + completionException + "/" + executionFuture);
+							executionMessageBuilder.append("completed exceptionally: " + 
+                                                           completionException + "/" + executionFuture);
 						}
 
 						if (i < allAllocationFutures.size() - 1) {
@@ -4868,13 +4871,13 @@ TASK::invoke
 在真正的运行时，是由
 
 ```java
-StreamTask（OneInputStreamTask、TwoInputStreamTask、StreamIterationHead、StreamIterationTail）
+StreamTask(OneInputStreamTask、TwoInputStreamTask、StreamIterationHead、StreamIterationTail)
 
 -> StreamOneInputProcessor或StreamTwoInputProcessor
 
 -> StreamInputProcessor.processInput()从InputGate读取数据
 
--> OneInputStreamOperator.processElement（）、processWatermark（）处理数据
+-> OneInputStreamOperator.processElement()、processWatermark()处理数据
 ```
 
 > TowInputStreamOperator同理，额外需要判断调用processElement1还是processElement2
@@ -4902,6 +4905,20 @@ TaskManager是flink中资源管理的基本组件，是所有执行任务的基�
 ### StreamTask
 
 ![1560406578603](/images/1560406578603.png)
+
+## 资源管理（待编写）
+
+### 总体设计
+
+
+
+### Yarn ResourceManager
+
+
+
+### K8s ResourceManager
+
+
 
 # Flink的数据抽象和数据交换过程
 
@@ -7822,13 +7839,88 @@ Table是Calcite中的表元数据的数据结构，在Flink中继承了Calcite�
 
 ### 元信息
 
-Catalog
+#### Catalog
+
+![1564473498549](images/1564473498549.png)
+
+Catalog用来保存和读写元数据，元数据包括库、表、视图、UDF。`Catalog`接口中定义了一系列操作元数据的方法：
+
+目前Flink中实现了2种元数据：通用内存型`GenericInMemoryCatalog`和`HiveCatalog`
+
+- **内存型GenericInMemoryCatalog**
+
+  Catalog是临时性的，元信息保存在内存中，无持久化存储。
+
+- **HiveCatalog**
+
+  对接Hive的元数据。
+
+> Flink1.9版本之前用ExternalCatalog对接外部元数据，现在已经标记为废弃，不做详细介绍。
+
+Catalog定义了对4中元数据类型的操作行为，每种元数据还有各自不同的行为，所以Flink定义了4类接口分别对应于4中元数据类型，如下。
+
+**CatalogDatabase**
+
+Catalog中数据库的元数据操作接口，属性、注释、总体描述和详细描述的方法。
+
+![1564474483801](images/1564474483801.png)
+
+
+
+**CatalogTable & CatalogView**
+
+`CatalogTable`和`CatalogView`是都Catalog中表格型数据的元数据操作接口，区别在于Table是实体的，View是虚拟的。两者相似，所以继承了共同的`CatalogBaseTable`接口。
+
+CatalogBaseTable中定义了一个Map，用来保存Table&View的属性。
+
+![1564474439608](images/1564474439608.png)
+
+
+
+**CatalogFunction**
+
+Catalog中的函数元数据的操作接口
+
+![1564475058662](images/1564475058662.png)
 
 #### HiveCatalog
+
+
 
 #### 统计信息
 
 统计信息用来在使用CBO(基于代价优化器）进行Sql优化的时候计算代价，选择执行代价最低的关系代数。
+
+#### CatalogManager
+
+`CatalogManager`是用来封装、管理所有Catalog的容器。支持table路径解析。
+
+`CatalogManager`兼容新的`Catalog`和旧的`ExternalCatalog`。
+
+```java
+@Internal
+public class CatalogManager {
+
+	// 所有的Catalog
+	private Map<String, Catalog> catalogs;
+
+	// 所有的ExternalCatalog，已标记为废弃
+	private Map<String, ExternalCatalog>  externalCatalogs;
+
+	// 当前Catalog和Database名称
+	private String currentCatalogName;
+	private String currentDatabaseName;
+
+	// 默认的Catalog
+	private final String defaultCatalogName;
+}
+```
+
+`CatalogManager`中提供了注册Catalog和获取Catalog等一系列方法。
+
+#### 元数据注入
+
+元数据注入分为两个部分，首先是通过API调用或者配置文件，将元数据注册到Flink中，Flink再将元数据注入到`Calcite`中。
 
 
 
@@ -8038,19 +8130,250 @@ Flink的Planner两个作用：
 
 ## SQL到执行
 
-### 从Sql语句到SqlNode树
+### 从Sql语句到Table
 
-Flink对解析部分的改进
+#### 源码解析
+
+以SQL查询语句为例，分析其过程。其总体过程是：
+
+1. 解析SQL字符串转换为`QueryOperation`
+
+   1） SQL字符串 -> SQLNode
+
+   2)   校验SqlNode
+
+   3）调用Calcite SQLToRelConverter将SqlNode转换为RelNode
+
+   4）RelNode转换为Operation
+
+2. 将解析到**`QueryOperation`**转换为`Table`，Table对象可以转换为DataStream也可以注册成一张表被TableAPI或者Sql使用
 
 
 
-### 从SqlNode树到RelNode树
+**入口**
+
+```java
+@Internal
+public class TableEnvironmentImpl implements TableEnvironment {
+    ...
+    //SQL DQL 查询
+    @Override
+	public Table sqlQuery(String query) {
+        //首先将查询语句转换为QueryOperation
+		List<Operation> operations = planner.parse(query);
+
+		Operation operation = operations.get(0);
+		
+		if (operation instanceof QueryOperation && !(operation instanceof ModifyOperation)) {
+            //使用QueryOperation创建Table对象,并返回Table对象,
+            //Table对象可以转换为DataStream也可以注册成一张表被TableAPI或者Sql使用
+			return createTable((QueryOperation) operation);
+		} else {
+			throw new ValidationException(
+				"Unsupported SQL query! sqlQuery() only accepts a single SQL query of type " +
+					"SELECT, UNION, INTERSECT, EXCEPT, VALUES, and ORDER_BY.");
+		}
+	}
+    
+    //SQL DQL Insert into 语句
+    @Override
+	public void insertInto(Table table, String path, String... pathContinued) {
+		List<String> fullPath = new ArrayList<>(Arrays.asList(pathContinued));
+		fullPath.add(0, path);
+
+		List<ModifyOperation> modifyOperations = Collections.singletonList(
+			new CatalogSinkModifyOperation(
+				fullPath,
+				table.getQueryOperation()));
+
+		if (isEagerOperationTranslation()) {
+			translate(modifyOperations);
+		} else {
+			buffer(modifyOperations);
+		}
+	}
+	
+    //SQL DDL语句
+	@Override
+	public void sqlUpdate(String stmt) {
+		List<Operation> operations = planner.parse(stmt);
+        
+        ...
+            
+		Operation operation = operations.get(0);
+
+		if (operation instanceof ModifyOperation) {
+            //alter 修改表
+			List<ModifyOperation> modifyOperations = Collections.singletonList((ModifyOperation) operation);
+			if (isEagerOperationTranslation()) {
+				translate(modifyOperations);
+			} else {
+				buffer(modifyOperations);
+			}
+		} else if (operation instanceof CreateTableOperation) {
+            //create 创建表
+			CreateTableOperation createTableOperation = (CreateTableOperation) operation;
+            //将表注册到元数据中
+			registerCatalogTableInternal(
+				createTableOperation.getTablePath(),
+				createTableOperation.getCatalogTable(),
+				createTableOperation.isIgnoreIfExists());
+		} else if (operation instanceof DropTableOperation) {
+            //drop 表
+			String[] name = ((DropTableOperation) operation).getTableName();
+			boolean isIfExists = ((DropTableOperation) operation).isIfExists();
+			String[] paths = catalogManager.getFullTablePath(Arrays.asList(name));
+			Optional<Catalog> catalog = getCatalog(paths[0]);
+            //不存在则抛出异常，存在则从元数据中删除表
+			if (!catalog.isPresent()) {
+				if (!isIfExists) {
+					throw new TableException("Catalog " + paths[0] + " does not exist.");
+				}
+			} else {
+					catalog.get().dropTable(new ObjectPath(paths[1], paths[2]), isIfExists);
+			}
+		} else {
+			//不支持的语法，抛出异常
+		}
+	}
+    ...
+}
+```
 
 
 
-如何识别对应的SqlNode转换为RelNode
+**Planner解析SQL语句**
 
-从CalciteRelNode到FlinkRelNode，以及为什么要这么做？
+```scala
+class StreamPlanner(
+    executor: Executor,
+    config: TableConfig,
+    functionCatalog: FunctionCatalog,
+    catalogManager: CatalogManager)
+  extends Planner {
+      ...
+      //解析SQL语句，返回QueryOperation
+      override def parse(stmt: String): JList[Operation] = {
+          //获取FlinkPlanner
+          val planner = getFlinkPlanner
+          // 解析SQL语句，转换为Calcite SqlNode
+          val parsed = planner.parse(stmt)
+		
+          //根据语句的类型执行不同的SqlNode到Operation的转换逻辑
+          parsed match {
+              //insert 语句
+              case insert: RichSqlInsert =>
+                  val targetColumnList = insert.getTargetColumnList
+                  if (targetColumnList != null && insert.getTargetColumnList.size() != 0) {
+                      throw new ValidationException("Partial inserts are not supported")
+                  }
+                  List(SqlToOperationConverter.convert(planner, insert))
+              //查询或DDL语句
+              case node if node.getKind.belongsTo(SqlKind.QUERY) || node.getKind.belongsTo(SqlKind.DDL) =>
+              	List(SqlToOperationConverter.convert(planner, parsed)).asJava
+              case _ =>
+              throw new TableException(
+                  "Unsupported SQL query! parse() only accepts SQL queries of type " +
+                  "SELECT, UNION, INTERSECT, EXCEPT, VALUES, ORDER_BY or INSERT;" +
+                  "and SQL DDLs of type " +
+                  "CREATE TABLE")
+          }
+      }
+      
+      ...
+}
+```
+
+
+
+**SqlNode到Operation**
+
+
+
+```java
+
+public class SqlToOperationConverter {
+    //转换入口，根据语句类型执行不同的转换
+	public static Operation convert(FlinkPlannerImpl flinkPlanner, SqlNode sqlNode) {
+		// 首先校验语句是否合法
+		final SqlNode validated = flinkPlanner.validate(sqlNode);
+      	SqlToOperationConverter converter = new SqlToOperationConverter(flinkPlanner);
+		if (validated instanceof SqlCreateTable) {
+			return converter.convertCreateTable((SqlCreateTable) validated);
+		} if (validated instanceof SqlDropTable) {
+			return converter.convertDropTable((SqlDropTable) validated);
+		} else if (validated instanceof RichSqlInsert) {
+			return converter.convertSqlInsert((RichSqlInsert) validated);
+		} else if (validated.getKind().belongsTo(SqlKind.QUERY)) {
+            //查询语句转换
+			return converter.convertSqlQuery(validated);
+		} else {
+			throw new TableException("Unsupported node type "
+				+ validated.getClass().getSimpleName());
+		}
+	}
+    
+    /** Fallback method for sql query. */
+	private Operation convertSqlQuery(SqlNode node) {
+		return toQueryOperation(flinkPlanner, node);
+	}
+    
+    //调用Planner将校验过SqlNode转换为RelNode逻辑节点树
+    private PlannerQueryOperation toQueryOperation(FlinkPlannerImpl planner, SqlNode validated) {
+		// transform to a relational tree
+		RelRoot relational = planner.rel(validated);
+        //将RelNode转换为QueryOperation
+		return new PlannerQueryOperation(relational.rel);
+	}
+}
+```
+
+
+
+**Planner执行具体转换过程**
+
+Planner可以看过一个代理类，将Sql的解析、验证、转换为RelNode都代理给Calcite执行。
+
+```scala
+class FlinkPlannerImpl(
+    config: FrameworkConfig,
+    val catalogReaderSupplier: JFunction[JBoolean, CatalogReader],
+    planner: RelOptPlanner,
+    val typeFactory: FlinkTypeFactory) {
+    
+    //调用Calcite的SqlToRelConverter将SQLNode转换为RelNode
+    def rel(validatedSqlNode: SqlNode): RelRoot = {
+        try {
+          assert(validatedSqlNode != null)
+          val rexBuilder: RexBuilder = createRexBuilder
+          val cluster: RelOptCluster = FlinkRelOptClusterFactory.create(planner, rexBuilder)
+          val catalogReader: CatalogReader = catalogReaderSupplier.apply(false)
+          //调用Calcite SqlToRelConverter进行转换，
+          val sqlToRelConverter: SqlToRelConverter = new SqlToRelConverter(
+            new ViewExpanderImpl,
+            validator,
+            catalogReader,
+            cluster,
+            convertletTable,
+            sqlToRelConverterConfig)
+          root = sqlToRelConverter.convertQuery(validatedSqlNode, false, true)
+          // we disable automatic flattening in order to let composite types pass without modification
+          // we might enable it again once Calcite has better support for structured types
+          // root = root.withRel(sqlToRelConverter.flattenTypes(root.rel, true))
+
+          // TableEnvironment.optimize will execute the following
+          // root = root.withRel(RelDecorrelator.decorrelateQuery(root.rel))
+          // convert time indicators
+          // root = root.withRel(RelTimeIndicatorConverter.convert(root.rel, rexBuilder))
+          root
+        } catch {
+          case e: RelConversionException => throw new TableException(e.getMessage)
+        }
+      }
+}
+```
+
+
 
 #### Flink中的FlinkLogicalRel（flink）
 
@@ -8113,7 +8436,61 @@ Flink RelNode与Calcite RelNode的对应关系如下：
 | FlinkLogicalWindowAggregate      | LogicalWindowAggregate      |                    |
 
 
-### 从Flink逻辑计划到Flink物理计划
+
+### 从Table到DataStream
+
+#### 源码分析
+
+当调用`TableEnvirmentImpl.sqlQuery()`获得Table对象之后，调用`StreamTableEnvirmentImpl.toXXXStream()`之后会触发Sql的执行。
+
+以`StreamTableEnvirmentImpl.toAppenedStream`为例
+
+```java
+public final class StreamTableEnvironmentImpl 
+    extends TableEnvironmentImpl implements StreamTableEnvironment {
+    ...
+	@Override
+	public <T> DataStream<T> toAppendStream(
+			Table table,
+			TypeInformation<T> typeInfo,
+			StreamQueryConfig queryConfig) {
+        //把Table的QueryOperation
+		OutputConversionModifyOperation modifyOperation = new OutputConversionModifyOperation(
+			table.getQueryOperation(),
+			TypeConversions.fromLegacyInfoToDataType(typeInfo),
+			OutputConversionModifyOperation.UpdateMode.APPEND);
+		tableConfig.setIdleStateRetentionTime(
+			Time.milliseconds(queryConfig.getMinIdleStateRetentionTime()),
+			Time.milliseconds(queryConfig.getMaxIdleStateRetentionTime()));
+		return toDataStream(table, modifyOperation);
+	}
+    
+    //
+    private <T> DataStream<T> toDataStream(Table table, OutputConversionModifyOperation modifyOperation) {
+        //将Operation转换为Transformation,调用Planner将Operation转换为Transformation
+		List<Transformation<?>> transformations = 	
+            planner.translate(Collections.singletonList(modifyOperation));
+
+		Transformation<T> transformation = getTransformation(table, transformations);
+		//将从Operation转换而来的Transformation添加到StreamExecutionEnvirment中
+		executionEnvironment.addOperator(transformation);
+		return new DataStream<>(executionEnvironment, transformation);
+	}
+}
+```
+
+上例中的如下代码片段，其核心过程是：
+
+**ModifyOperation -> RelNode -> FlinkPhysicalRel -> ExecNode ->Transformation**，TableAPI部分对此过程有过描述，参考相关章节。
+
+```java
+List<Transformation<?>> transformations = 	
+            planner.translate(Collections.singletonList(modifyOperation));
+```
+
+
+
+`Transformation`被添加到`StreamExecutionEnvironment`之后，调用`StreamExecutionEnvironment.execute()`就会触发生成图、执行Job的过程。
 
 #### 流对应关系（flink）
 
@@ -8261,7 +8638,7 @@ public QueryOperation filter(Expression condition, QueryOperation child) {
 	}
 ```
 
-#### 从QueryOperation到StreamTransformation
+#### 从QueryOperation到Transformation
 
 **Planner继承关系**
 
@@ -11251,7 +11628,224 @@ Flink能够跟踪时间在整个系统中处理的延迟，该功能默认是关
 
 
 
-## 自定义监控指标（待编写)
+## 自定义监控指标
+
+上边已经介绍了Flink Metric的主要概念和支持的监控指标，在实际的环境中，这些指标可能不够，例如我们可能需要业务层面的指标，那么就需要自定义指标。
+
+接下来通过几个示例，展示如何将不同类型的自定义的监控指标添加到Metrics中。
+
+### Counter类型的指标
+
+**使用默认的实现**
+
+```java
+public class MyMapper extends RichMapFunction<String, String> {
+  private transient Counter counter;
+ //获取Group，并且添加一个名字为myCounter的指标
+  @Override
+  public void open(Configuration config) {
+    this.counter = getRuntimeContext()
+      .getMetricGroup()
+      .counter("myCounter");
+  }
+  //指标的计算，使用默认的Counter实现
+  @Override
+  public String map(String value) throws Exception {
+    this.counter.inc();
+    return value;
+  }
+}
+```
+
+**使用自定义的Counter实现**
+
+```java
+public class MyMapper extends RichMapFunction<String, String> {
+  private transient Counter counter;
+
+  @Override
+  public void open(Configuration config) {
+    this.counter = getRuntimeContext()
+      .getMetricGroup()
+      .counter("myCustomCounter", new CustomCounter());
+  }
+
+  @Override
+  public String map(String value) throws Exception {
+    this.counter.inc();
+    return value;
+  }
+}
+```
+
+
+
+### Gauge类型的指标
+
+使用Gauge类型的指标，需要提供一个`org.apache.flink.metrics.Gauge`接口的实现。
+
+```java
+public class MyMapper extends RichMapFunction<String, String> {
+  private transient int valueToExpose = 0;
+
+  @Override
+  public void open(Configuration config) {
+    getRuntimeContext()
+      .getMetricGroup()
+       //注册一个Gauge的类型的指标到MetricGroup
+      .gauge("MyGauge", new Gauge<Integer>() {
+        @Override
+        public Integer getValue() {
+          return valueToExpose;
+        }
+      });
+  }
+
+  @Override
+  public String map(String value) throws Exception {
+    //计算指标
+    valueToExpose++;
+    return value;
+  }
+}
+```
+
+
+
+> Reporter会将Guage对象转换为String，所以必须要实现toString（）方法。
+
+
+
+### Histogram类型指标
+
+**使用自定义的Histogram代码示例**
+
+Flink不提供Histogram的默认实现，需要自己实现Histogram。
+
+```java
+public class MyMapper extends RichMapFunction<Long, Long> {
+  private transient Histogram histogram;
+
+  @Override
+  public void open(Configuration config) {
+     
+    this.histogram = getRuntimeContext()
+      .getMetricGroup()
+        //注册histogram类型的指标
+      .histogram("myHistogram", new MyHistogram());
+  }
+
+  @Override
+  public Long map(Long value) throws Exception {
+    this.histogram.update(value);
+    return value;
+  }
+}
+```
+
+**使用Codahale / DropWizard的Histogram**
+
+Flink不提供Histogram的默认实现，但提供了一个允许使用Codahale / DropWizard的Histogram的包装类。 要使用此包装器，需要在pom.xml中添加以下依赖项：
+
+```xml
+<dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-metrics-dropwizard</artifactId>
+      <version>1.10-SNAPSHOT</version>
+</dependency>
+```
+
+然后就可以直接使用Codahale / DropWizard中的Histogram，代码示例如下：
+
+```java
+public class MyMapper extends RichMapFunction<Long, Long> {
+  private transient Histogram histogram;
+
+  @Override
+  public void open(Configuration config) {
+    com.codahale.metrics.Histogram dropwizardHistogram =
+      new com.codahale.metrics.Histogram(new SlidingWindowReservoir(500));
+
+    this.histogram = getRuntimeContext()
+      .getMetricGroup()
+      .histogram("myHistogram", new DropwizardHistogramWrapper(dropwizardHistogram));
+  }
+  
+  @Override
+  public Long map(Long value) throws Exception {
+    this.histogram.update(value);
+    return value;
+  }
+}
+```
+
+
+
+### Meter类型的指标
+
+**使用自定义Meter**
+
+代码示例：
+
+使用`markEvent()`表示新的事件，触发更新计算指标。
+
+```java
+public class MyMapper extends RichMapFunction<Long, Long> {
+  private transient Meter meter;
+
+  @Override
+  public void open(Configuration config) {
+    this.meter = getRuntimeContext()
+      .getMetricGroup()
+      .meter("myMeter", new MyMeter());
+  }
+
+  @Override
+  public Long map(Long value) throws Exception {
+    this.meter.markEvent();
+    return value;
+  }
+}
+```
+
+
+
+**使用Codeahale/DropWizard中的Meter实现**
+
+在pom.xml中添加如下依赖：
+
+```xml
+<dependency>
+      <groupId>org.apache.flink</groupId>
+      <artifactId>flink-metrics-dropwizard</artifactId>
+      <version>1.10-SNAPSHOT</version>
+</dependency>
+```
+
+
+
+代码示例：
+
+```java
+public class MyMapper extends RichMapFunction<Long, Long> {
+  private transient Meter meter;
+
+  @Override
+  public void open(Configuration config) {
+    com.codahale.metrics.Meter dropwizardMeter = new com.codahale.metrics.Meter();
+
+    this.meter = getRuntimeContext()
+      .getMetricGroup()
+      .meter("myMeter", new DropwizardMeterWrapper(dropwizardMeter));
+  }
+
+  @Override
+  public Long map(Long value) throws Exception {
+    this.meter.markEvent();
+    return value;
+  }
+}
+```
 
 ## 源码分析
 
@@ -11543,4 +12137,846 @@ RockDB StateBackend支持大状态的代价是相比内存型的状态，性能�
 JobManager在Flink集群中负责Job的调度执行和资源管理，是极其重要的组件。默认情况下JobManager是单点的，可能导致单点失败的问题（SPOF），JobManager组件不可用之后，无法发布新的Job并且所有的正在运行的作业也会出错。
 
 <font color=red>所以在生产环境强烈建议配置JobManager的高可用。</font>
+
+
+
+# Flink RPC框架
+
+Flink中需要远程交互的组件，如`JobMaster`、`TaskManager(TaskExecutor)`、`Dispatcher`、`ResourceManager`等所有都涉及到了分布式交互，如Job发布、集群状态通知、作业状态通知、资源申请等等。
+
+Flink底层RPC框架基于Akka实现，因为构建可靠的分布式系统是一件很那的事情，Akka提供了分布式系统中行为的抽象和封装，使用akka可以避免重复制造轮子。
+
+## Akka简介
+
+### Akka是什么
+
+Akka是一个开发并发、容错和可伸缩应用的框架。它是Actor Model的一个实现，和Erlang的并发模型很像。在Actor模型中，所有的实体被认为是独立的actors。actors和其他actors通过发送异步消息通信。Actor模型的强大来自于异步。它也可以显式等待响应，这使得可以执行同步操作。但是，强烈不建议同步消息，因为它们限制了系统的伸缩性。每个actor有一个邮箱(mailbox)，它收到的消息存储在里面。另外，每一个actor维护自身单独的状态。一个Actors网络如下所示：
+
+![img](images/p)
+
+每个actor是一个单一的线程，它不断地从其邮箱中poll(拉取)消息，并且连续不断地处理。对于已经处理过的消息的结果，actor可以改变它自身的内部状态或者发送一个新消息或者孵化一个新的actor。尽管单个的actor是自然有序的，但一个包含若干个actor的系统却是高度并发的并且极具扩展性的。因为那些处理线程是所有actor之间共享的。这也是我们为什么不该在actor线程里调用可能导致阻塞的“调用”。因为这样的调用可能会阻塞该线程使得他们无法替其他actor处理消息。
+
+### 创建Akka系统
+
+Akka系统的核心ActorSystem和Actor，若需构建一个Akka系统，首先需要创建ActorSystem，创建完ActorSystem后，可通过其创建Actor（注意：Akka不允许直接new一个Actor，只能通过 Akka 提供的某些 API 才能创建或查找 Actor，一般会通过 ActorSystem#actorOf和ActorContext#actorOf来创建 Actor），另外，我们只能通过ActorRef（Actor的引用， 其对原生的 Actor 实例做了良好的封装，外界不能随意修改其内部状态）来与Actor进行通信。如下代码展示了如何配置一个Akka系统。
+
+```java
+// 1. 构建ActorSystem	
+// 使用缺省配置	
+ActorSystem system = ActorSystem.create("sys");	
+// 也可显示指定appsys配置	
+// ActorSystem system1 = ActorSystem.create("helloakka", ConfigFactory.load("appsys"));	
+	
+// 2. 构建Actor,获取该Actor的引用，即ActorRef	
+ActorRef helloActor = system.actorOf(Props.create(HelloActor.class), "helloActor");	
+	
+// 3. 给helloActor发送消息	
+helloActor.tell("hello helloActor", ActorRef.noSender());	
+	
+// 4. 关闭ActorSystem	
+system.terminate();
+
+```
+
+**Actor路径**
+
+在Akka中，创建的每个Actor都有自己的路径，该路径遵循 ActorSystem 的层级结构，大致如下：
+
+- 本地路径
+
+  ```
+  akka://sys/user/helloActor
+  ```
+
+  路径含义如下：
+
+  - **akka**，表示akka本地协议
+
+  - **sys**，创建的ActorSystem的名字；
+
+  - **user**，通过ActorSystem#actorOf和ActorContext#actorOf 方法创建的 Actor 都属于/user下，与/user对应的是/system， 其是系统层面创建的，与系统整体行为有关，在开发阶段并不需要对其过多关注
+
+  - **helloActor**，创建的本地HelloActor
+
+- 远程路径
+
+  ```
+  akka.tcp://sys@l27.0.0.1:2020/user/remoteActor
+  ```
+
+  - **akka.tcp**，akka远程协议，通信方式为tcp；
+  - **sys@127.0.0.1:2020**，ActorSystem名字及远程主机ip和端口号。
+  - **user**，与本地协议中的含义一样
+  - **remoteActor**，创建的远程Actor。
+
+**获取Actor**
+
+在于Actor通讯之前需要获取ActorRef，获取ActorRef需要提供Actor的路径，如下代码所示：
+
+```java
+ActorSystem system = ActorSystem.create("sys")；	
+ActorSelection as = system.actorSelection("/path/to/actor");	
+	
+Timeout timeout = new Timeout(Duration.create(2, "seconds"));	
+Future<ActorRef> fu = as.resolveOne(timeout);	
+	
+fu.onSuccess(new OnSuccess<ActorRef>() {	
+    @Override	
+public void onSuccess(ActorRef actor) {	
+        System.out.println("actor:" + actor);	
+        actor.tell("hello actor", ActorRef.noSender());	
+    }	
+}, system.dispatcher());	
+	
+fu.onFailure(new OnFailure() {	
+    @Override	
+public void onFailure(Throwable failure) {	
+        System.out.println("failure:" + failure);	
+    }	
+}, system.dispatcher());
+
+```
+
+上述代码中是获取本地Actor的ActorRef，如果想获取远程ActorRef则，则使用Actor路径小节中的远程路径格式类似的路径即可，注意IP地址和端口号是必须的。
+
+### Akka通讯
+
+Akka有两种核心的异步通讯方式：tell和ask。
+
+- tell 表示 “fire-and-forget”，即异步的发送消息无需等待返回结果
+- ask 异步发送消息并返回代表可能回复的Future。
+
+#### tell方式
+
+当使用tell方式时，表示仅仅使用异步方式给某个Actor发送消息，无需等待Actor的响应结果，并且也不会阻塞后续代码的运行，如：
+
+```java
+helloActor.tell("hello helloActor", ActorRef.noSender());
+```
+
+其中：
+
+第一个参数为消息，它可以是任何可序列化的数据或对象
+
+第二个参数表示发送者，通常来讲是另外一个 Actor 的引用， ActorRef.noSender()表示无发送者（实际上是一个 叫做deadLetters的Actor）。
+
+#### ask方式
+
+当需要从Actor获取响应结果时，可使用ask方法，ask方法会将返回结果包装在scala.concurrent.Future中，然后通过异步回调获取返回结果。如调用方：
+
+```java
+// 异步发送消息给Actor，并获取响应结果	
+Future<Object> fu = Patterns.ask(printerActor, "hello helloActor", timeout);	
+fu.onComplete(new OnComplete<Object>() {	
+@Override	
+public void onComplete(Throwable failure, String success) throws Throwable {	
+if (failure != null) {	
+             System.out.println("failure is " + failure);	
+         } else {	
+             System.out.println("success is " + success);	
+         }	
+    }	
+}, system.dispatcher());
+
+```
+
+HelloActor处理消息方法的代码大致如下：
+
+```java
+
+private void handleMessage(Object object) {	
+if (object instanceof String) {	
+String str = (String) object;	
+      log.info("[HelloActor] message is {}, sender is {}", str,     getSender().path().toString());	
+// 给发送者发送消息	
+      getSender().tell(str, getSelf());	
+    }	
+
+```
+
+
+
+##  RPC框架关键对象
+
+**RPC继承体系总览**
+
+![1564536897964](images/1564536897964.png)
+
+
+
+### RpcGateway
+
+RpcGateway是Fink远程调用的接口协议，对外提供可调用的接口，基本上所有的实现RPC的组件、类都实现了此接口。
+
+在远程调用过程中，直接调用各个`RpcGateway`接口的实现类，对接口的调用，RpcService
+
+```java
+/**
+ * Rpc gateway interface which has to be implemented by Rpc gateways.
+ */
+public interface RpcGateway {
+
+	//
+	String getAddress();
+
+	//
+	String getHostname();
+}
+```
+
+
+
+### RpcEndpoint
+
+`RpcEndpoint`是所有rpc请求端的基类，Flink中所有提供远程调用服务的类都继承了`RpcEndpoint`。
+
+`RpcEndpoint`的重要子类：
+
+- Dispatcher
+- JobMaster
+- ResourceManager
+- TaskExecutor。
+
+**RpcEndpoint的关键属性**
+
+```java
+public abstract class RpcEndpoint implements RpcGateway, AutoCloseableAsync {
+
+	/** RPCService用来启动RPCServer和获取RpcGateway*/
+	private final RpcService rpcService;
+
+	/** RpcEndpoint的唯一标识*/
+	private final String endpointId;
+    
+	/** RPCServer (Interface to access the underlying rpc server. )*/
+	protected final RpcServer rpcServer;
+
+	/** A reference to the endpoint's main thread, if the current method is called by the main thread. */
+	final AtomicReference<Thread> currentMainThread = new AtomicReference<>(null);
+
+	/** 主线程执行器，用来执行rpc服务器的主线程中的回调 */
+	private final MainThreadExecutor mainThreadExecutor;
+    ...
+}
+```
+
+****
+
+
+
+**RpcEndpoint单线程执行模型**
+
+在Flink的设计中，同一个RpcEndpoint中的所有调用只有1个线程处理，叫做Endpoint的主线程。与Akka的actor模型一样，所有对状态数据的修改在同一个线程中执行，所以不会存在并发的问题。
+
+RpcEndpoint提供了runAsync(Runnable)、callAsync(Callable, Time)来执行RPC调用。
+
+#### **RpcEndpoint的构建**
+
+**入口**
+
+```java
+public abstract class RpcEndpoint implements RpcGateway, AutoCloseableAsync {
+	...
+	protected RpcEndpoint(final RpcService rpcService, final String endpointId) {
+		this.rpcService = checkNotNull(rpcService, "rpcService");
+		this.endpointId = checkNotNull(endpointId, "endpointId");
+		//调用RpcService启动RpcEndpoint
+		this.rpcServer = rpcService.startServer(this);
+
+		this.mainThreadExecutor = new MainThreadExecutor(rpcServer, this::validateRunsInMainThread);
+	}
+}
+```
+
+**启动RpcServer**
+
+```java
+@ThreadSafe
+public class AkkaRpcService implements RpcService {
+    @Override
+	public <C extends RpcEndpoint & RpcGateway> RpcServer startServer(C rpcEndpoint) {
+		checkNotNull(rpcEndpoint, "rpc endpoint");
+
+		CompletableFuture<Void> terminationFuture = new CompletableFuture<>();
+		final Props akkaRpcActorProps;
+		
+        //判断RpcEndpoint的类型，根据类型创建不同的AkkaRpcActor属性
+		if (rpcEndpoint instanceof FencedRpcEndpoint) {
+			akkaRpcActorProps = Props.create(
+				FencedAkkaRpcActor.class,
+				rpcEndpoint,
+				terminationFuture,
+				getVersion(),
+				configuration.getMaximumFramesize());
+		} else {
+			akkaRpcActorProps = Props.create(
+				AkkaRpcActor.class,
+				rpcEndpoint,
+				terminationFuture,
+				getVersion(),
+				configuration.getMaximumFramesize());
+		}
+
+		ActorRef actorRef;
+		//根据上边创建的Actor Prop生成Actor，获取Actor引用，并保存Actor和RpcEndpoint的对应关系
+        //创建出来的Actor是底层akka调用的实际接收者，RPC的请求在客户端被封装成RpcInvocation对象，以Akka消息的形式发送。
+		synchronized (lock) {
+			checkState(!stopped, "RpcService is stopped");
+			actorRef = actorSystem.actorOf(akkaRpcActorProps, rpcEndpoint.getEndpointId());
+			actors.put(actorRef, rpcEndpoint);
+		}
+
+		LOG.info("Starting RPC endpoint for {} at {} .", rpcEndpoint.getClass().getName(), actorRef.path());
+
+		final String akkaAddress = AkkaUtils.getAkkaURL(actorSystem, actorRef);
+		final String hostname;
+		Option<String> host = actorRef.path().address().host();
+		if (host.isEmpty()) {
+			hostname = "localhost";
+		} else {
+			hostname = host.get();
+		}
+        
+		// 获取这个Endpoint的所有RpcGateway
+		Set<Class<?>> implementedRpcGateways = new HashSet<>
+            (RpcUtils.extractImplementedRpcGateways(rpcEndpoint.getClass()));
+
+		implementedRpcGateways.add(RpcServer.class);
+		implementedRpcGateways.add(AkkaBasedEndpoint.class);
+		
+         // 创建一个InvocationHandler，用于将rpc请求包装成LocalRpcInvocation消息并发送给RpcServer(本地)
+		final InvocationHandler akkaInvocationHandler;
+		//根据RpcEndpoint的类型创建不同的InvocationHandler
+		if (rpcEndpoint instanceof FencedRpcEndpoint) {
+			// a FencedRpcEndpoint needs a FencedAkkaInvocationHandler
+			akkaInvocationHandler = new FencedAkkaInvocationHandler<>(
+				akkaAddress,
+				hostname,
+				actorRef,
+				configuration.getTimeout(),
+				configuration.getMaximumFramesize(),
+				terminationFuture,
+				((FencedRpcEndpoint<?>) rpcEndpoint)::getFencingToken);
+
+			implementedRpcGateways.add(FencedMainThreadExecutable.class);
+		} else {
+			akkaInvocationHandler = new AkkaInvocationHandler(
+				akkaAddress,
+				hostname,
+				actorRef,
+				configuration.getTimeout(),
+				configuration.getMaximumFramesize(),
+				terminationFuture);
+		}
+
+		// 当Flink使用embedded模式或者所有的Flink代码都是使用自定义类加载器动态加载的时候，
+        //相比使用系统类加载器，使用当前类的类加载器更好。
+		ClassLoader classLoader = getClass().getClassLoader();
+		
+        // 生成一个包含这些接口的代理，将调用转发到InvocationHandler
+		@SuppressWarnings("unchecked")
+		RpcServer server = (RpcServer) Proxy.newProxyInstance(
+			classLoader,
+			implementedRpcGateways.toArray(new Class<?>[implementedRpcGateways.size()]),
+			akkaInvocationHandler);
+
+		return server;
+	}
+}
+```
+
+
+
+#### RpcEndpoint启动
+
+`RpcEndpoint`的启动本质上是调用在构建过程中初始化的`RpcServer.start()`。实质上是通知底层的`AkkaRpcActor`切换到START状态，开始处理远程调用请求。
+
+```java
+public abstract class RpcEndpoint implements RpcGateway, AutoCloseableAsync {
+	public final void start() {
+		rpcServer.start();
+	}
+}
+```
+
+通知AkkaRpcActor切换到START状态。
+
+```java
+class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, RpcServer {
+    @Override
+	public void start() {
+		rpcEndpoint.tell(ControlMessages.START, ActorRef.noSender());
+	}
+}
+```
+
+
+
+### RpcService
+
+
+
+![1564542759066](images/1564542759066.png)
+
+`RpcService`是`RpcEndpoint`的成员变量。
+
+`RpcService`的作用如下：
+
+- 启动和停止`RpcServer`和连接`RPCEndpoint`。
+- 根据指定的连接地址，连接到`RPCServer`会返回一个`RpcGateway`。分为带FencingToken和不带FencingToke的版本。
+- 延迟/立刻调度Runnable、Callable。
+
+`RpcService`跟`RpcGateway`类似，也提供了获取地址和端口的方法。
+
+#### RpcService的关键属性
+
+`AkkaRpcService`是`RpcService`的唯一实现。
+
+```java
+@ThreadSafe
+public class AkkaRpcService implements RpcService {
+
+	static final int VERSION = 1;
+
+	private final Object lock = new Object();
+
+	private final ActorSystem actorSystem;
+	private final AkkaRpcServiceConfiguration configuration;
+
+	@GuardedBy("lock")
+	private final Map<ActorRef, RpcEndpoint> actors = new HashMap<>(4);
+
+	private final String address;
+	private final int port;
+
+	private final ScheduledExecutor internalScheduledExecutor;
+
+	private final CompletableFuture<Void> terminationFuture;
+
+	private volatile boolean stopped;
+}
+```
+
+
+
+#### RpcService的构建
+
+`RpcService`会在`ClusterEntrypoint(JobMaster)`和`TaskManagerRunner(TaskExecutor)`启动的过程中被初始化并启动。
+
+> 所有的`RpcService`都是使用 `AkkaRpcServiceUtils.createRpcService`创建出来的。
+
+```java
+public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErrorHandler {
+   ...
+    protected void initializeServices(Configuration configuration) throws Exception {
+
+		synchronized (lock) {
+			final String bindAddress = configuration.getString(JobManagerOptions.ADDRESS);
+			final String portRange = getRPCPortRange(configuration);
+			//创建Rpc服务
+			commonRpcService = createRpcService(configuration, bindAddress, portRange);
+
+			// 更新配置并初创建其他一系列服务
+			configuration.setString(JobManagerOptions.ADDRESS, commonRpcService.getAddress());
+			configuration.setInteger(JobManagerOptions.PORT, commonRpcService.getPort());
+
+			ioExecutor = Executors.newFixedThreadPool(
+				Hardware.getNumberCPUCores(),
+				new ExecutorThreadFactory("cluster-io"));
+			haServices = createHaServices(configuration, ioExecutor);
+			blobServer = new BlobServer(configuration, haServices.createBlobStore());
+			blobServer.start();
+			heartbeatServices = createHeartbeatServices(configuration);
+			metricRegistry = createMetricRegistry(configuration);
+
+			final RpcService metricQueryServiceRpcService = 
+                MetricUtils.startMetricsRpcService(configuration, bindAddress);
+			metricRegistry.startQueryService(metricQueryServiceRpcService, null);
+
+			archivedExecutionGraphStore = 
+                createSerializableExecutionGraphStore(configuration,commonRpcService.getScheduledExecutor());
+		}
+	}
+    ...
+    //调用AkkaRpcServiceUtils.createRpcService创建RpcService
+    @Nonnull
+	private RpcService createRpcService(Configuration configuration, String bindAddress, String portRange)
+        throws Exception {
+		return AkkaRpcServiceUtils.createRpcService(bindAddress, portRange, configuration);
+	}
+}
+```
+
+
+
+#### AkkaRpcService
+
+`AkkaRpcService`是`RpcService`的唯一实现。
+
+`AkkaRpcService`中包含了一个`ActorSystem`，保存了ActorRef和RpcEndpoint之间的映射关系。
+
+其核心属性如下：
+
+```java
+@ThreadSafe
+public class AkkaRpcService implements RpcService {
+
+	...
+        
+	static final int VERSION = 1;
+
+	private final Object lock = new Object();
+
+	private final ActorSystem actorSystem;
+	private final AkkaRpcServiceConfiguration configuration;
+
+	@GuardedBy("lock")
+	private final Map<ActorRef, RpcEndpoint> actors = new HashMap<>(4);
+
+	private final String address;
+	private final int port;
+
+	private final ScheduledExecutor internalScheduledExecutor;
+
+	private final CompletableFuture<Void> terminationFuture;
+
+	private volatile boolean stopped;
+	...
+}
+```
+
+
+
+**AkkaRpcService启动**
+
+
+
+### RpcServer
+
+`RpcServer`是`RpcEndpoint`的成员变量，在`RpcEndpoint`启动的时候调用`RpcService`创建出来的。
+
+`RpcServer`有两个实现：`AkkaInvocationHandler`和`FencedAkkaInvocationHandler`。
+
+
+
+![1564553362026](images/1564553362026.png)
+
+
+
+### AkkaRpcActor
+
+
+
+![1564554551432](images/1564554551432.png)
+
+`AkkaRpcActor`负责处理如下类型消息：
+
+- LocalRpcInvocation
+- RunAsync
+- CallAsync
+- ControlMessages
+
+`LocalRpcInvocation`类型的调用指派给`RpcEndpoint`进行处理，如果有响应结果，则将响应结果返还给Sender。
+
+`RunAsync`、`CallAsync`类型的消息，带有可以执行的代码，直接在Actor的线程中执行。
+
+`ControlMessage`用来控制Actor的行为，`ControlMessages#START`启动Actor开始处理消息，`ControlMessages#STOP`停止处理消息，停止后收到的消息丢弃掉。
+
+`AkkaRpcActor`在`RpcService.startServer()`中被创建出来。
+
+## RPC通讯过程
+
+### RPC请求的发送
+
+在RpcService中调用`connect()`方法与对端的`RpcEndpoint`建立连接，connect()方法根据给的地址返回`InvocationHandler`（`AkkaInvocationHandler`或者`FencedAkkaInvocationHandler`）。
+
+在上文中客户端会提供代理对象，而代理对象会调用AkkaInvocationHandler的invoke方法并传入Rpc调用的方法和参数信息。
+
+```java
+class AkkaInvocationHandler implements InvocationHandler, AkkaBasedEndpoint, RpcServer {
+	@Override
+	public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+		Class<?> declaringClass = method.getDeclaringClass();
+
+		Object result;
+		//判断方法所属Class
+		if (declaringClass.equals(AkkaBasedEndpoint.class) ||
+			declaringClass.equals(Object.class) ||
+			declaringClass.equals(RpcGateway.class) ||
+			declaringClass.equals(StartStoppable.class) ||
+			declaringClass.equals(MainThreadExecutable.class) ||
+			declaringClass.equals(RpcServer.class)) {
+			result = method.invoke(this, args);
+		} else if (declaringClass.equals(FencedRpcGateway.class)) {
+			....
+		} else {
+            //rpc调用
+			result = invokeRpc(method, args);
+		}
+
+		return result;
+	}
+}
+```
+
+`AkkaInvocationHandler`中判断方法所属的类，如果是RPC方法，则调用`invokeRpc`方法。
+
+```java
+private Object invokeRpc(Method method, Object[] args) throws Exception {
+		String methodName = method.getName();
+		Class<?>[] parameterTypes = method.getParameterTypes();
+		Annotation[][] parameterAnnotations = method.getParameterAnnotations();
+		Time futureTimeout = extractRpcTimeout(parameterAnnotations, args, timeout);
+		
+    	//将方法调用封装为RPCInvocation消息
+    	//如果是本地则生成LocaRPCInvocation，本地消息不需要序列化
+    	//如果是远程调用则创建RemoteRpcInvocation
+		final RpcInvocation rpcInvocation = createRpcInvocationMessage(methodName, parameterTypes, args);
+		
+		Class<?> returnType = method.getReturnType();
+
+		final Object result;
+		//根据方法调用的返回类型，如果是void，则使用向actor发送tell消息，如果是有返回类型则向actor发送ask类型的消息
+		if (Objects.equals(returnType, Void.TYPE)) {
+			tell(rpcInvocation);
+
+			result = null;
+		} else {
+			// execute an asynchronous call
+			CompletableFuture<?> resultFuture = ask(rpcInvocation, futureTimeout);
+
+			CompletableFuture<?> completableFuture = resultFuture.thenApply((Object o) -> {
+				if (o instanceof SerializedValue) {
+					try {
+						return  ((SerializedValue<?>) o).deserializeValue(getClass().getClassLoader());
+					} catch (IOException | ClassNotFoundException e) {
+						throw new CompletionException(
+							new RpcException("Could not deserialize the serialized payload of RPC method : "
+								+ methodName, e));
+					}
+				} else {
+					return o;
+				}
+			});
+
+			if (Objects.equals(returnType, CompletableFuture.class)) {
+				result = completableFuture;
+			} else {
+				try {
+					result = completableFuture.get(futureTimeout.getSize(), futureTimeout.getUnit());
+				} catch (ExecutionException ee) {
+					...
+				}
+			}
+		}
+
+		return result;
+	}
+```
+
+
+
+
+
+### RPC请求的处理
+
+Rpc消息是通过`RpcEndpoint`所绑定的Actor的`ActorRef`发送的，所以接收到消息的就是`RpcEndpoint`构造期间生成的`AkkaRpcActor`。
+
+`AkkaRpcActor`接收到的消息总共有三种
+
+- 一种是握手消息，如上文所述，在客户端构造时会通过`ActorSelection`发送过来。收到消息后会检查接口，版本，如果一致就返回成功
+- 第二种是启停消息。例如在`RpcEndpoint`调用start方法后，就会向自身发送一条`Processing.START`消息，来转换当前Actor的状态为STARTED。STOP也类似。并且只有在Actor状态为STARTED时才会处理Rpc请求
+- 第三种就是Rpc请求消息，通过解析`RpcInvocation`获取方法名和参数类型，并从`RpcEndpoint`类中找到`Method`对象，并通过反射调用该方法。如果有返回结果，会以Akka消息的形式发送回sender。
+
+```java
+class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends AbstractActor {	
+    //对消息按照其Class类型指定不同的消息处理函数
+	@Override
+	public Receive createReceive() {
+		return ReceiveBuilder.create()
+			.match(RemoteHandshakeMessage.class, this::handleHandshakeMessage)
+			.match(ControlMessages.class, this::handleControlMessage)
+			.matchAny(this::handleMessage)
+			.build();
+	}
+	
+	private void handleMessage(final Object message) {
+		if (state.isRunning()) {
+			mainThreadValidator.enterMainThread();
+
+			try {
+				handleRpcMessage(message);
+			} finally {
+				mainThreadValidator.exitMainThread();
+			}
+		} else {
+				rpcEndpoint.getClass().getName(),
+				message.getClass().getName());
+
+			sendErrorIfSender(new AkkaRpcException(
+				String.format("Discard message, because the rpc endpoint %s has not been started yet.",
+                              rpcEndpoint.getAddress())));
+		}
+	}
+	//处理控制消息
+	private void handleControlMessage(ControlMessages controlMessage) {
+		switch (controlMessage) {
+			case START:
+				state = state.start(this);
+				break;
+			case STOP:
+				state = state.stop();
+				break;
+			case TERMINATE:
+				state.terminate(this);
+				break;
+			default:
+				handleUnknownControlMessage(controlMessage);
+		}
+	}
+	//未知消息
+	private void handleUnknownControlMessage(ControlMessages controlMessage) {
+		final String message = String.format("Received unknown control message %s. Dropping this message!",
+                                             controlMessage);
+		log.warn(message);
+		sendErrorIfSender(new AkkaUnknownMessageException(message));
+	}
+
+	protected void handleRpcMessage(Object message) {
+		if (message instanceof RunAsync) {
+			handleRunAsync((RunAsync) message);
+		} else if (message instanceof CallAsync) {
+			handleCallAsync((CallAsync) message);
+		} else if (message instanceof RpcInvocation) {
+			handleRpcInvocation((RpcInvocation) message);
+		} else {
+			log.warn(
+				"Received message of unknown type {} with value {}. Dropping this message!",
+				message.getClass().getName(),
+				message);
+
+			sendErrorIfSender(new AkkaUnknownMessageException("Received unknown message " + message +
+				" of type " + message.getClass().getSimpleName() + '.'));
+		}
+	}
+	//握手消息
+	private void handleHandshakeMessage(RemoteHandshakeMessage handshakeMessage) {
+		if (!isCompatibleVersion(handshakeMessage.getVersion())) {
+			sendErrorIfSender(new AkkaHandshakeException(
+				String.format(
+					"Version mismatch between source (%s) and target (%s) rpc component. Please verify that all components have the same version.",
+					handshakeMessage.getVersion(),
+					getVersion())));
+		} else if (!isGatewaySupported(handshakeMessage.getRpcGateway())) {
+			sendErrorIfSender(new AkkaHandshakeException(
+				String.format(
+					"The rpc endpoint does not support the gateway %s.",
+					handshakeMessage.getRpcGateway().getSimpleName())));
+		} else {
+			getSender().tell(new Status.Success(HandshakeSuccessMessage.INSTANCE), getSelf());
+		}
+	}
+}
+```
+
+
+
+## Rpc消息类型
+
+![1564564209302](images/1564564209302.png)
+
+
+
+- **握手消息**
+
+  RemoteHandshakeMessage，与Actor握手消息
+
+  HandshakeSuccessMessage，与Actor握手成功消息
+
+- **Fenced消息**
+
+  
+
+- **调用消息**
+
+  `LocalRpcInvocation`，本地`RpcEndpoint`调用消息，同一个JVM内的调用。
+
+  `RemoteRpcInvocation`，远程`RpcEndpoint`的调用消息，包括本地不同JVM和跨节点的JVM调用。
+
+- **执行消息**
+
+  1. **RunAsync**，带有`Runnable`对象的异步执行请求消息。
+
+     `RpcEndpoint.runAsync`方法调用`RpcService.runAsync`；
+
+     然后调用的是`RpcService.scheduleRunAsync`；
+
+     `RpcService.scheduleRunAsync`调用`AkkaInvocationHanlder.tell`方法发送`RunAsync`消息；
+
+  ```java
+  //RpcEndpoint.java
+  protected void runAsync(Runnable runnable) {
+  		rpcServer.runAsync(runnable);
+  }
+  
+  //RpcService(以AkkaInvocationHanlder为例)
+  @Override
+  public void runAsync(Runnable runnable) {
+      scheduleRunAsync(runnable, 0L);
+  }
+  
+  @Override
+  public void scheduleRunAsync(Runnable runnable, long delayMillis) {
+      checkNotNull(runnable, "runnable");
+      checkArgument(delayMillis >= 0, "delay must be zero or greater");
+  
+      if (isLocal) {
+          long atTimeNanos = delayMillis == 0 ? 0 : System.nanoTime() + (delayMillis * 1_000_000);
+          tell(new RunAsync(runnable, atTimeNanos));
+      } else {
+          throw new RuntimeException("Trying to send a Runnable to a remote actor at " +
+                                     rpcEndpoint.path() + ". This is not supported.");
+      }
+  }
+  ```
+
+  2. **CallAsync**，带有Callable对象的异步执行请求消息。
+
+     `RpcEndpoint`的`callAsync`方法使用的方法内部调用的是`scheduleRunAsync`；
+
+     然后是调用`RpcService.callAsync`方法；
+
+     `RpcService`调用`AkkaInvocationHanlder.ask`方法；
+
+     `AkkaInvocationHanlder.ask`方法中调用`Patterns.ask`，发送`CallAsync`消息。
+
+  ```java
+  //RpcEndpoint.java
+  protected void scheduleRunAsync(Runnable runnable, Time delay) {
+  		scheduleRunAsync(runnable, delay.getSize(), delay.getUnit());
+  	}
+  
+  //RpcService(以AkkaInvocationHanlder为例)
+  @Override
+  public <V> CompletableFuture<V> callAsync(Callable<V> callable, Time callTimeout) {
+      if (isLocal) {
+          @SuppressWarnings("unchecked")
+          CompletableFuture<V> resultFuture = (CompletableFuture<V>) ask(new CallAsync(callable), callTimeout);
+  
+          return resultFuture;
+      } else {
+          throw new RuntimeException("Trying to send a Callable to a remote actor at " +
+                                     rpcEndpoint.path() + ". This is not supported.");
+      }
+  }
+  
+  protected CompletableFuture<?> ask(Object message, Time timeout) {
+      return FutureUtils.toJava(
+          Patterns.ask(rpcEndpoint, message, timeout.toMilliseconds()));
+  }
+  ```
+
+  
+
+
 
