@@ -444,7 +444,7 @@ spec:
           name: query
         env:
         - name: JOB_MANAGER_RPC_ADDRESS
-          value: flink-jobmanage
+          value: flink-jobmanager
 ```
 
 
@@ -4518,11 +4518,25 @@ ExecutionJobVertex方法，用来将一个个JobVertex封装成ExecutionJobVerte
 
 将`JobGraph`按照拓扑排序后得到一个`JobVertex`集合，遍历该`JobVertex`集合，即从`source`开始，将`JobVertex`封装成`ExecutionJobVertex`，并依次创建`ExecutionVertex`、`Execution`、`IntermediateResult`和`IntermediateResultPartition`。然后通过`ejv.connectToPredecessor()`方法，创建`ExecutionEdge`，建立当前节点与其上游节点之间的联系，即连接`ExecutionVertex`和`IntermediateResultPartition`。
 
+# Flink集群启动（待编写）
+
+## Standalone集群启动
+
+启动一个standalone集群，启动的是org.apache.flink.runtime.entrypoint.StandaloneSessionClusterEntrypoint这个java类。
+
+
+
+## Yarn Flink集群启动
+
 # Flink调度与资源管理
 
 ## Job提交
 
-### 提交流程
+Flink 提供了多种不同的方式提交任务和与任务进行交互，包括 Flink 命令行，Scala Shell，Python Shell、SQL Client，Restful API 和 Web。Flink 首先提供的最重要的是命令行，其次是 SQL Client 用于提交 SQL 任务的运行，还有就是 Scala Shell 提交 Table API 的任务。同时，Flink 也提供了 Restful 服务，用户可以通过HTTP方式进行调用。此外，还有 Web 的方式可以提交任务。
+
+![1564881787005](images/1564881787005.png)
+
+### 提交流程概述
 
 Flink在Yarn等资源管理平台上执行Job的时候，有两种模式：**会话模式**和**作业模式**，在Flink部署章节已经提到过，本节的目的是详细的介绍两种模式下Flink机制的过程和差异。
 
@@ -4544,20 +4558,61 @@ Flink在Yarn等资源管理平台上执行Job的时候，有两种模式：**会
 
 
 
-#### 不同运行模式下的提交流程（待继续）
+#### 不同运行模式下的提交流程
+
+![1564838701981](images/1564838701981.png)
+
+1. Client向集群管理平台提交请求，创建Flink集群。
+2. 资源管理平台收到Client请求后，创建Flink集群。
+3. Flink集群启动完毕之后，
 
 **会话模式（WithDispatcher）**
 
+会话模式下，Flink集群首先在资源管理平台上创建好，此时Flink集群已经启动，Application Master启动，Dispatcher组件和ResourceManager组件已经可以提供服务，JobManager此时尚未启动，TaskManager可能启动也可能未启动，没有需要的时候不启动TM，可以提高集群资源利用率。
+
+在yarn模式下，可以按需申请Yarn Container启动TaskManager。
+
+在K8s模式下，目前则是一次性申请Flink集群所需的所有资源。
+
+其大体过程如下：
+
+1. Flink Client生成Graph，如果是流则生成StreamGraph，再生成JobGraph，如果是批，则直接生成JobGraph，并且进行初步的优化，通过Rest接口向Dispatcher提交作业（JobGraph、jar文件、配置文件等）
+2. Dispatcher收到作业提交请求之后，为该作业启动1个JobManager（在新版的Flink中，一个JobManager只负责1个Job）。
+3. JobManager收到JobGraph，将JobGraph转换为ExecutionGraph，向ResourceManager请求资源（slot）。
+4. ResourceManager收到资源请求之后，向资源管理平台（yarn等）申请资源。
+5. 资源管理平台收到请求之后，创建TaskManager，每个TaskManger有n个slot。TaskManager注册到ResourceManager。
+6. ResourceManager向TaskManager请求资源（slot），并且将请求资源的JobManager通知TaskManager。
+7. TaskManager向JobManager提供资源（slot）。
+8. JobManager申请到足够的资源之后，根据ExecutionGraph向TaskManager提交Task。TaskManager启动Task，Task之间形成一个物理上的DAG执行图，不同节点上的Task通过网络交换数据。
+
 ![1564651314626](images/1564651314626.png)
 
-​	会话模式下，首先会启动好Flink集群，ResourceManager、Dispatcher、JobManager、TM都启动完毕，其中TM的数量由用户启动Flink集群时指定，但是不一定会完全启动，Flink可以动态申请TM（Container）。
-
-1. Flink Client首先生成Graph，如果是流则生成StreamGraph，再生成JobGraph，如果是批，则直接生成JobGraph，并且进行初步的优化。
-2. Client通过Http接口将JobGraph和相关的Jar文件、配置文件提交给Dispatcher
+​	
 
 **作业模式（Without Dispatcher）**
 
+作业模式下，1个Job对应1个Flink集群，在提交Job的时候，Flink集群尚未创建。所以首先要创建Flink集群（ResourceManager、Dispatcher），等Flink集群启动完毕之后再提交Job。
+
+在yarn模式下，可以按需申请Yarn Container启动TaskManager。
+
+在K8s模式下，目前则是一次性申请Flink集群所需的所有资源。
+
+其大体过程如下：
+
+1. Flink Client首先在资源管理平台提交创建Flink集群的请求，请求中带有所需要的资源要求。
+2. 集群根据资源要求，创建Flink集群，启动好Application Master，此时未必有TM在运行（没有需要的时候不启动TM，可以提高集群资源利用率）。在AM中创建好ResourceManager和Dispatcher。
+3. Flink Client生成Graph，如果是流则生成StreamGraph，再生成JobGraph，如果是批，则直接生成JobGraph，并且进行初步的优化，通过Rest接口向Dispatcher提交作业（JobGraph、jar文件、配置文件等）
+4. Dispatcher收到作业提交请求之后，为该作业启动1个JobManager（在新版的Flink中，一个JobManager只负责1个Job）。
+5. JobManager收到JobGraph，将JobGraph转换为ExecutionGraph，向ResourceManager请求资源（slot）。
+6. ResourceManager收到资源请求之后，向资源管理平台（yarn等）申请资源。
+7. 资源管理平台收到请求之后，创建TaskManager，每个TaskManger有n个slot。TaskManager注册到ResourceManager。
+8. ResourceManager向TaskManager请求资源（slot），并且将请求资源的JobManager通知TaskManager。
+9. TaskManager向JobManager提供资源（slot）。
+10. JobManager申请到足够的资源之后，根据ExecutionGraph向TaskManager提交Task。TaskManager启动Task，Task之间形成一个物理上的DAG执行图，不同节点上的Task通过网络交换数据。
+
 ![1564651348392](images/1564651348392.png)
+
+
 
 #### 会话模式和作业模式的适用场景
 
@@ -4566,7 +4621,258 @@ Flink在Yarn等资源管理平台上执行Job的时候，有两种模式：**会
 | 会话模式 | 共享Dispatcher和ResourceManager<br />共享资源<br />适合执行时间短，频繁执行的短任务<br /> |
 | 作业模式 | 独享Dispatcher和ResourceManager<br />按需申请资源<br />长周期执行的任务，集群异常影响范围小<br /> |
 
+#### 客户端源码分析
 
+##### 提交入口
+
+`ClientFrontend.java`是使用shell提交Flink Job的入口。
+
+```java
+protected void run(String[] args) throws Exception {
+
+		final Options commandOptions = CliFrontendParser.getRunCommandOptions();
+
+		final Options commandLineOptions = CliFrontendParser.mergeOptions(commandOptions, customCommandLineOptions);
+
+		final CommandLine commandLine = CliFrontendParser.parse(commandLineOptions, args, true);
+
+		final RunOptions runOptions = new RunOptions(commandLine);
+		//创建PackagedProgram
+		final PackagedProgram program;
+		program = buildProgram(runOptions);
+
+		final CustomCommandLine<?> customCommandLine = getActiveCustomCommandLine(commandLine);
+		//开始运行创建的PackagedProgram
+		runProgram(customCommandLine, commandLine, runOptions, program);
+	}
+```
+
+`PackagedProgram`封装了打包好的Flink APP jar文件、额外需要的Class类的URL、入口类的完整路径、参数（运行参数和用户自定义参数）。
+
+##### 执行Program
+
+```java
+public class CliFrontend {	
+	private <T> void runProgram(
+			CustomCommandLine<T> customCommandLine,
+			CommandLine commandLine,
+			RunOptions runOptions,
+			PackagedProgram program) throws ProgramInvocationException, FlinkException {
+        //根据用户命令行参数，创建ClusterDescriptor，ClusterDescriptor是一个集群属性的描述对象，
+        //用于部署集群（例如 Yarn、Mesos），并且返回一个与集群通信的客户端
+		final ClusterDescriptor<T> clusterDescriptor = 
+            customCommandLine.createClusterDescriptor(commandLine);
+
+		try {
+            //获取Clust ID
+			final T clusterId = customCommandLine.getClusterId(commandLine);
+
+			final ClusterClient<T> client;
+
+			// 如果是任务模式并且是detached模式，则首先创建集群，再提交job
+			if (clusterId == null && runOptions.getDetachedMode()) {
+				int parallelism = 
+                    runOptions.getParallelism() == -1 ? defaultParallelism : runOptions.getParallelism();
+				//生成Job Graph，StreamGrap和JobGraph的生成是在Flink Client中执行的,
+                //提交给Dispatcher的是JobGraph，而不是原始的Jar文件
+				final JobGraph jobGraph = 
+                    PackagedProgramUtils.createJobGraph(program, configuration, parallelism);
+				//创建ClusterSpecification，描述集群部署的资源需求、规模等。
+				final ClusterSpecification clusterSpecification = 
+                    customCommandLine.getClusterSpecification(commandLine);
+                //部署集群并返回集群的Client
+				client = clusterDescriptor.deployJobCluster(
+					clusterSpecification,
+					jobGraph,
+					runOptions.getDetachedMode());
+
+				logAndSysout("Job has been submitted with JobID " + jobGraph.getJobID());
+
+				try {
+					client.shutdown();
+				} catch (Exception e) {
+					LOG.info("Could not properly shut down the client.", e);
+				}
+			} else {
+				final Thread shutdownHook;
+				if (clusterId != null) {
+					client = clusterDescriptor.retrieve(clusterId);
+					shutdownHook = null;
+				} else {
+					// also in job mode we have to deploy a session cluster because the job
+					// might consist of multiple parts (e.g. when using collect)
+					final ClusterSpecification clusterSpecification = 
+                        customCommandLine.getClusterSpecification(commandLine);
+					client = clusterDescriptor.deploySessionCluster(clusterSpecification);
+					// if not running in detached mode, add a shutdown hook to shut down cluster if client exits
+					// there's a race-condition here if cli is killed before shutdown hook is installed
+					if (!runOptions.getDetachedMode() && runOptions.isShutdownOnAttachedExit()) {
+						shutdownHook = 
+                            ShutdownHookUtil.addShutdownHook(client::shutDownCluster, 
+                                                             client.getClass().getSimpleName(), LOG);
+					} else {
+						shutdownHook = null;
+					}
+				}
+
+				try {
+					client.setPrintStatusDuringExecution(runOptions.getStdoutLogging());
+					client.setDetached(runOptions.getDetachedMode());
+
+					int userParallelism = runOptions.getParallelism();
+					if (ExecutionConfig.PARALLELISM_DEFAULT == userParallelism) {
+						userParallelism = defaultParallelism;
+					}
+
+					executeProgram(program, client, userParallelism);
+				} finally {
+					...
+				}
+			}
+		} finally {
+			try {
+				clusterDescriptor.close();
+			} catch (Exception e) {
+				LOG.info("Could not properly close the cluster descriptor.", e);
+			}
+		}
+	}
+    
+    protected void executeProgram(PackagedProgram program, ClusterClient<?> client, int parallelism) 
+        throws ProgramMissingJobException, ProgramInvocationException {
+		//调用ClusterClient提交Job
+		final JobSubmissionResult result = client.run(program, parallelism);
+    }
+}
+```
+
+
+
+##### Cluster与ApplicationMaster交互
+
+`ClusterClient`封装了与远程Flink集群交互的行为，`ClustetClient`有几种实现，其继承关系如下：
+
+![1564891621519](images/1564891621519.png)
+
+Flink Job的提交有两种模式：交互模式与非交互模式，一般使用交互模式。
+
+```java
+public abstract class ClusterClient<T> {
+    ...
+    public JobSubmissionResult run(PackagedProgram prog, int parallelism)
+			throws ProgramInvocationException, ProgramMissingJobException {
+		final ClassLoader contextClassLoader = Thread.currentThread().getContextClassLoader();
+		try {
+			Thread.currentThread().setContextClassLoader(prog.getUserCodeClassLoader());
+			if (prog.isUsingProgramEntryPoint()) {//如果包含入口类，则使用非交互式模式提交Job
+				final JobWithJars jobWithJars = prog.getPlanWithJars();
+				return run(jobWithJars, parallelism, prog.getSavepointSettings());
+			}
+			else if (prog.isUsingInteractiveMode()) {//使用交互式模式提交Job
+				log.info("Starting program in interactive mode (detached: {})", isDetached());
+
+				final List<URL> libraries = prog.getAllLibraries();
+
+				ContextEnvironmentFactory factory = new ContextEnvironmentFactory(this, libraries,
+				prog.getClasspaths(), prog.getUserCodeClassLoader(), parallelism, isDetached(),
+				prog.getSavepointSettings());
+				ContextEnvironment.setAsContext(factory);
+
+				try {
+					// 调用main方法
+					prog.invokeInteractiveModeForExecution();
+					if (lastJobExecutionResult == null && factory.getLastEnvCreated() == null) {
+						throw new ProgramMissingJobException("The program didn't contain a Flink job.");
+					}
+					if (isDetached()) {
+						// in detached mode, we execute the whole user code to extract the Flink job,
+                        //afterwards we run it here
+						return ((DetachedEnvironment) factory.getLastEnvCreated()).finalizeExecute();
+					}
+					else {
+						// in blocking mode, we execute all Flink jobs contained in the user code 
+                        //and then return here
+						return this.lastJobExecutionResult;
+					}
+				}
+				finally {
+					ContextEnvironment.unsetContext();
+				}
+			}
+			else {
+				//抛出异常"PackagedProgram does not have a valid invocation mode.";
+			}
+		}
+		finally {
+			Thread.currentThread().setContextClassLoader(contextClassLoader);
+		}
+	}
+    ...
+}
+```
+
+1. **交互模式**
+
+   非交互模式是最常用的模式，在ClusterClient调用`prog.invokeInteractiveModeForExecution()`，触发对`main`函数的调用。
+
+   如下例所示，一个简单的Flink应用，`prog.invokeInteractiveModeForExecution()`实际上是触发了编写的Flink 应用 `SocketWindowWordCount`类的`main`函数，调用main函数之后，出发了构建和执行数据流。构建数据流即生成Graph，执行数据流则是将Graph提交到Flink集群中开始执行。
+
+   ```java
+   public class SocketWindowWordCount{
+       public static void main(String[] args){
+           // get the execution environment
+           final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+   
+           // get input data by connecting to the socket
+           DataStream<String> text = env.socketTextStream(hostname, port, "\n");
+   
+           // parse the data, group it, window it, and aggregate the counts
+           DataStream<WordWithCount> windowCounts = text
+   
+                   .flatMap(new FlatMapFunction<String, WordWithCount>() {
+                       @Override
+                       public void flatMap(String value, Collector<WordWithCount> out) {
+                           for (String word : value.split("\\s")) {
+                               out.collect(new WordWithCount(word, 1L));
+                           }
+                       }
+                   })
+   
+                   .keyBy("word")
+                   .timeWindow(Time.seconds(5))
+   
+                   .reduce(new ReduceFunction<WordWithCount>() {
+                       @Override
+                       public WordWithCount reduce(WordWithCount a, WordWithCount b) {
+                           return new WordWithCount(a.word, a.count + b.count);
+                       }
+                   });
+   
+           // print the results with a single thread, rather than in parallel
+           windowCounts.print().setParallelism(1);
+   
+           env.execute("Socket Window WordCount");
+       }
+   }
+   ```
+
+   
+
+2. **非交互模式**
+
+   非交互模式提交过程如下：
+
+   （1）创建JobWithJars对象，JobWithJars是flink的数据流计划，包含了jar中所有的类，以及用于加载用户代码的ClassLoader
+
+   （2）获取任务计划
+
+   （3）调用run的重载方法，进行提交
+
+   ```java
+   
+   ```
+
+   
 
 ### 资源管理
 
@@ -4577,7 +4883,8 @@ ResourceManager是Flink集群的资源管理器，其作用如下：
 - **Giving failure notifications** to JobManagers and TaskManagers
 
 - 缓存TaskManager(即容器），等待一段时间之后再释放掉不用的容器，避免资源反复的申请释放。
-- 
+
+
 
 **ResourceManager的体系**
 
