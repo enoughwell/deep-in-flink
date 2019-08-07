@@ -4520,13 +4520,527 @@ ExecutionJobVertex方法，用来将一个个JobVertex封装成ExecutionJobVerte
 
 # Flink集群启动（待编写）
 
+## 集群角色及其功能
+
+### JobManager（待编写）
+
+
+
+### TaskManager（待编写）
+
+
+
 ## Standalone集群启动
 
-启动一个standalone集群，启动的是org.apache.flink.runtime.entrypoint.StandaloneSessionClusterEntrypoint这个java类。
+Standalone集群启动的时候，会启动`Application Master`和`TaskManager`两个角色。其中Application Master即原先的`JobManager`进程，在新版本的Flink中，`JobManager`的角色已经弱化，`Application Master`是指`JobManager`所在的进程，其中包含了`Dispatcher`、`JobManager`、`ResourceManager`三种组件。
+
+Flink集群有两种模式：任务模式和会话模式。在启动过程中，无论是脚本还是Java中都针对不同的模式，执行了不同的启动流程。
+
+### 启动分析-Shell
+
+#### 集群启动入口 
+
+集群启动入口为start-cluster.sh，实际上是调用`jobmanager.sh`启动`JobManager`和调用`taskmanager.sh`启动`TaskManager`。
+
+```shell
+#start-cluster.sh
+
+bin=`dirname "$0"`
+bin=`cd "$bin"; pwd`
+
+. "$bin"/config.sh
+
+# 启动JobManager实例
+shopt -s nocasematch
+if [[ $HIGH_AVAILABILITY == "zookeeper" ]]; then
+    # HA Mode，读取所有的Master节点，调用jobmanager.sh依次启动。
+    readMasters
+	
+    echo "Starting HA cluster with ${#MASTERS[@]} masters."
+
+    for ((i=0;i<${#MASTERS[@]};++i)); do
+        master=${MASTERS[i]}
+        webuiport=${WEBUIPORTS[i]}
+
+        if [ ${MASTERS_ALL_LOCALHOST} = true ] ; then
+            "${FLINK_BIN_DIR}"/jobmanager.sh start "${master}" "${webuiport}"
+        else
+            ssh -n $FLINK_SSH_OPTS $master -- "nohup /bin/bash -l \"${FLINK_BIN_DIR}/jobmanager.sh\" start ${master} ${webuiport} &"
+        fi
+    done
+
+else
+    echo "Starting cluster."
+
+    # 非HA模式，则启动单个JobManager进程
+    "$FLINK_BIN_DIR"/jobmanager.sh start
+fi
+shopt -u nocasematch
+
+# 启动TaskManager(TaskExecutor)
+TMSlaves start
+
+```
+
+#### JobManager启动
+
+在`start-cluster.sh`中调用了`jobmanager.sh`启动Job Manager，最终调用了`flink-daemon.sh`或`flink-console.sh`启动`JobManager`进程。
+
+```shell
+# jobmanager.sh
+# 以console模式启动JobManager，关闭console，JobManager关闭
+if [[ $STARTSTOP == "start-foreground" ]]; then
+	exec "${FLINK_BIN_DIR}"/flink-console.sh $JOBMANAGER_TYPE "${args[@]}"
+# 后台模式启动JobManager
+else
+	"${FLINK_BIN_DIR}"/flink-daemon.sh $STARTSTOP $JOBMANAGER_TYPE "${args[@]}"
+fi
+```
+
+在`flink-daemon.sh`中实际调用Java类启动JobManager进程。
+
+```shell
+# Start/stop a Flink daemon.
+USAGE="Usage: flink-daemon.sh (start|stop|stop-all) (taskexecutor|zookeeper|historyserver|standalonesession|standalonejob) [args]"
+
+STARTSTOP=$1
+DAEMON=$2
+ARGS=("${@:3}") # get remaining arguments as array
+
+bin=`dirname "$0"`
+bin=`cd "$bin"; pwd`
+
+. "$bin"/config.sh
+
+case $DAEMON in
+    (taskexecutor)
+        CLASS_TO_RUN=org.apache.flink.runtime.taskexecutor.TaskManagerRunner
+    ;;
+
+    (zookeeper)
+        CLASS_TO_RUN=org.apache.flink.runtime.zookeeper.FlinkZooKeeperQuorumPeer
+    ;;
+
+    (historyserver)
+        CLASS_TO_RUN=org.apache.flink.runtime.webmonitor.history.HistoryServer
+    ;;
+	## 启动会话模式集群
+    (standalonesession)
+        CLASS_TO_RUN=org.apache.flink.runtime.entrypoint.StandaloneSessionClusterEntrypoint
+    ;;
+    ## 启动任务模式集群
+    (standalonejob)
+        CLASS_TO_RUN=org.apache.flink.container.entrypoint.StandaloneJobClusterEntryPoint
+    ;;
+
+    (*)
+        echo "Unknown daemon '${DAEMON}'. $USAGE."
+        exit 1
+    ;;
+esac
+```
+
+
+
+#### 启动TaskManager
+
+`TaskManager`中的启动入口在`config.sh`中的`TMSlaves()`中完成。
+
+```shell
+# config.sh
+# starts or stops TMs on all slaves
+# TMSlaves start|stop
+TMSlaves() {
+    CMD=$1
+    # 读取所有的TaskManger信息，依次管理TaskManager，分为本地TaskManager和远程TaskManager
+    # 本地TaskManager调用本地taskmanager.sh
+    # 远程TaskManager通过ssh远程调用taskmanager.sh
+    readSlaves
+
+    if [ ${SLAVES_ALL_LOCALHOST} = true ] ; then
+        # all-local setup
+        for slave in ${SLAVES[@]}; do
+            "${FLINK_BIN_DIR}"/taskmanager.sh "${CMD}"
+        done
+    else
+        # non-local setup
+        # Stop TaskManager instance(s) using pdsh (Parallel Distributed Shell) when available
+        command -v pdsh >/dev/null 2>&1
+        if [[ $? -ne 0 ]]; then
+            for slave in ${SLAVES[@]}; do
+                ssh -n $FLINK_SSH_OPTS $slave -- "nohup /bin/bash -l \"${FLINK_BIN_DIR}/taskmanager.sh\" \"${CMD}\" &"
+            done
+        else
+            PDSH_SSH_ARGS="" PDSH_SSH_ARGS_APPEND=$FLINK_SSH_OPTS pdsh -w $(IFS=, ; echo "${SLAVES[*]}") \
+                "nohup /bin/bash -l \"${FLINK_BIN_DIR}/taskmanager.sh\" \"${CMD}\""
+        fi
+    fi
+}
+```
+
+`TaskManager`的参数配置(jvm参数和其他tm相关的参数)在`taskmanager.sh`完成，最终实际调用`flink-daemon.sh`进行启动
+
+```shell
+# taskmanager.sh
+
+# 前台启动，即sonsole模式
+if [[ $STARTSTOP == "start-foreground" ]]; then
+    exec "${FLINK_BIN_DIR}"/flink-console.sh $ENTRYPOINT "${ARGS[@]}"
+else
+	# 启动1个TaskManager
+    if [[ $FLINK_TM_COMPUTE_NUMA == "false" ]]; then
+        # Start a single TaskManager
+        "${FLINK_BIN_DIR}"/flink-daemon.sh $STARTSTOP $ENTRYPOINT "${ARGS[@]}"
+    # 在支持NUMA(Non-Uniform Memory Access)特性的CPU架构的机器上启动启动多个TaskManager,
+    # 每个NUMA Node启动一个TaskManager
+    else
+        read -ra NODE_LIST <<< $(numactl --show | grep "^nodebind: ")
+        for NODE_ID in "${NODE_LIST[@]:1}"; do
+            # Start a TaskManager for each NUMA node
+            numactl --membind=$NODE_ID --cpunodebind=$NODE_ID -- "${FLINK_BIN_DIR}"/flink-daemon.sh $STARTSTOP $ENTRYPOINT "${ARGS[@]}"
+        done
+    fi
+fi
+```
+
+至此集群的各个组件启动完毕，接下来会深入到源码中，分析每一类组件的启动。
+
+### NUMA特性
+
+随着科学计算、事务处理对计算机性能要求的不断提高，SMP（对称多处理器）系统的应用越来越广泛，规模也越来越大，但由于传统的SMP系统中，所有处理器都共享系统总线，因此当处理器的数目增大时，系统总线的竞争冲突加大，系统总线将成为瓶颈，可扩展能力受到极大限制。
+
+ NUMA（Non-Uniform Memory Access Architecture）将CPU和内存进行分组，每一个分组叫做一个Node，Node内的CPU核共享内存，Node之间通过内部连接进行访问。有效结合了SMP系统易编程性和MPP（大规模并行）系统易扩展性的特点，较好解决了SMP系统的可扩展性问题。
+
+如下图右侧所示，一台机器是有4个处理器，有2个内存块。将2个处理器和1个内存块关联起来，称为一个NUMA Node，一共分成了2个NUMA Node。
+
+**SMP与NUMA的架构示意图**
+
+![1565057851199](images/1565057851199.png)
+
+NUMA中，虽然内存直接关联在CPU上，但是由于内存被平均分配在了各个die上。只有当CPU访问自身直接关联内存对应的物理地址时，响应时间较短。而如果需要访问其他CPU关联的内存的数据时，就需要通过inter-connect通道访问，跨Node的内存访问相比SMP架构变慢了。
+
+### 启动源码分析-Java
+
+**Flink集群入口继承关系**
+
+![1565059649013](images/1565059649013.png)
+
+如上图所示，Flink集群的启动入口是`ClusterEntrypoint`，其子类有`JobClusterEntrypoint`和`SessionClusterPoint`。
+
+**SessionClusterEntrypoint**
+
+会话模式集群的抽象基类，多个Job共享一个会话集群，其有3个不同的实现：`YarnSessionClusterEntrypoint`、`StandalonesessionClusterEntrypoint`、`MesosSessionClusterEntrypoint`，如其名所示，分别对应于不同的集群管理平台。
+
+**JobClusterEntrypoint**
+
+任务模式集群的抽象基类，每个job对应于1个集群，其有3个不同的实现：`YarnJobClusterEntrypoint`、`StandaloneJobClusterEntrypoint`、`MesosJobClusterEntrypoint`，如其名所示，分别对应于不同的集群管理平台。
+
+无论是SessionClusterEntrypoint还是JobClusterEntrypoint其最底层的实现类中，都提供了main方法，针对不同的集群管理平台，实现各自的流程来启动Java进程。
+
+下边是`StandaloneSessionCluster`的启动过程的代码分析。
+
+#### JobManager启动
+
+启动集群的时候，首先启动的是`JobManager`（Application Master）的角色。
+
+**启动入口**
+
+入口是`StandaloneSessionClusterEntrypoint`，核心代码如下所示：
+
+```java
+StandaloneSessionClusterEntrypoint
+public class StandaloneSessionClusterEntrypoint extends SessionClusterEntrypoint {
+
+	public static void main(String[] args) {
+		...
+		//获取集群的配置参数
+		EntrypointClusterConfiguration entrypointClusterConfiguration = null;
+		final CommandLineParser<EntrypointClusterConfiguration> commandLineParser = 
+            new CommandLineParser<>(new EntrypointClusterConfigurationParserFactory());
+
+		try {
+			entrypointClusterConfiguration = commandLineParser.parse(args);
+		} catch (FlinkParseException e) {
+			//记录日志并退出
+		}
+
+		Configuration configuration = loadConfiguration(entrypointClusterConfiguration);
+
+		StandaloneSessionClusterEntrypoint entrypoint = 
+            new StandaloneSessionClusterEntrypoint(configuration);
+		//开始真正的启动，其实现在父类中
+		ClusterEntrypoint.runClusterEntrypoint(entrypoint);
+	}
+}
+```
+
+**启动过程**
+
+```java
+public abstract class ClusterEntrypoint implements AutoCloseableAsync, FatalErrorHandler {
+    //1. 启动辅助方法，用来跟踪集群退出
+    public static void runClusterEntrypoint(ClusterEntrypoint clusterEntrypoint) {
+
+		final String clusterEntrypointName = clusterEntrypoint.getClass().getSimpleName();
+		try {
+			clusterEntrypoint.startCluster();
+		} catch (ClusterEntrypointException e) {
+			//异常退出
+		}
+    }
+    
+    //2. 启动集群前，配置文件系统、安全上下文，系统异常退出做记录并清理状态
+    public void startCluster() throws ClusterEntrypointException {
+		LOG.info("Starting {}.", getClass().getSimpleName());
+
+		try {
+
+			configureFileSystems(configuration);
+
+			SecurityContext securityContext = installSecurityContext(configuration);
+			//配置安全上下文完毕，开始启动进程
+			securityContext.runSecured((Callable<Void>) () -> {
+				runCluster(configuration);
+
+				return null;
+			});
+		} catch (Throwable t) {
+			//记录异常，清理状态，并退出
+	}
+    //3. 
+        private void runCluster(Configuration configuration) throws Exception {
+		synchronized (lock) {
+            //初始化集群的RpcService
+			initializeServices(configuration);
+
+			// 将JobManager的地址端口写入配置信息
+			configuration.setString(JobManagerOptions.ADDRESS, commonRpcService.getAddress());
+			configuration.setInteger(JobManagerOptions.PORT, commonRpcService.getPort());
+
+			final DispatcherResourceManagerComponentFactory<?> dispatcherResourceManagerComponentFactory = 
+                createDispatcherResourceManagerComponentFactory(configuration);
+			//创建组件并启动服务
+			clusterComponent = dispatcherResourceManagerComponentFactory.create(
+				configuration,
+				commonRpcService,
+				haServices,
+				blobServer,
+				heartbeatServices,
+				metricRegistry,
+				archivedExecutionGraphStore,
+				new RpcMetricQueryServiceRetriever(metricRegistry.getMetricQueryServiceRpcService()),
+				this);
+			//注册集群组件关闭时的回调处理
+			clusterComponent.getShutDownFuture().whenComplete(
+				(ApplicationStatus applicationStatus, Throwable throwable) -> {
+					if (throwable != null) {
+						shutDownAsync(
+							ApplicationStatus.UNKNOWN,
+							ExceptionUtils.stringifyException(throwable),
+							false);
+					} else {
+						// This is the general shutdown path. If a separate more specific shutdown was
+						// already triggered, this will do nothing
+						shutDownAsync(
+							applicationStatus,
+							null,
+							true);
+					}
+				});
+		}
+	}
+}
+```
+
+
+
+**各个组件的创建和启动**
+
+组件的创建在
+
+```java
+public abstract class AbstractDispatcherResourceManagerComponentFactory<T extends Dispatcher, U extends RestfulGateway> implements DispatcherResourceManagerComponentFactory<T> {
+	@Override
+	public DispatcherResourceManagerComponent<T> create(
+			Configuration configuration,
+			RpcService rpcService,
+			HighAvailabilityServices highAvailabilityServices,
+			BlobServer blobServer,
+			HeartbeatServices heartbeatServices,
+			MetricRegistry metricRegistry,
+			ArchivedExecutionGraphStore archivedExecutionGraphStore,
+			MetricQueryServiceRetriever metricQueryServiceRetriever,
+			FatalErrorHandler fatalErrorHandler) throws Exception {
+
+		LeaderRetrievalService dispatcherLeaderRetrievalService = null;
+		LeaderRetrievalService resourceManagerRetrievalService = null;
+		WebMonitorEndpoint<U> webMonitorEndpoint = null;
+		ResourceManager<?> resourceManager = null;
+		JobManagerMetricGroup jobManagerMetricGroup = null;
+		T dispatcher = null;
+
+		try {
+			dispatcherLeaderRetrievalService = highAvailabilityServices.getDispatcherLeaderRetriever();
+		
+			resourceManagerRetrievalService = highAvailabilityServices.getResourceManagerLeaderRetriever();
+
+			final LeaderGatewayRetriever<DispatcherGateway> dispatcherGatewayRetriever = 
+                new RpcGatewayRetriever<>(
+				rpcService,
+				DispatcherGateway.class,
+				DispatcherId::fromUuid,
+				10,
+				Time.milliseconds(50L));
+
+			final LeaderGatewayRetriever<ResourceManagerGateway> resourceManagerGatewayRetriever = 
+                new RpcGatewayRetriever<>(
+				rpcService,
+				ResourceManagerGateway.class,
+				ResourceManagerId::fromUuid,
+				10,
+				Time.milliseconds(50L));
+
+			final ExecutorService executor = WebMonitorEndpoint.createExecutorService(
+				configuration.getInteger(RestOptions.SERVER_NUM_THREADS),
+				configuration.getInteger(RestOptions.SERVER_THREAD_PRIORITY),
+				"DispatcherRestEndpoint");
+
+			final long updateInterval = configuration.getLong(MetricOptions.METRIC_FETCHER_UPDATE_INTERVAL);
+			final MetricFetcher metricFetcher = updateInterval == 0
+				? VoidMetricFetcher.INSTANCE
+				: MetricFetcherImpl.fromConfiguration(
+					configuration,
+					metricQueryServiceRetriever,
+					dispatcherGatewayRetriever,
+					executor);
+			//创建启动web 监控 RpcEndpoint
+			webMonitorEndpoint = restEndpointFactory.createRestEndpoint(
+				configuration,
+				dispatcherGatewayRetriever,
+				resourceManagerGatewayRetriever,
+				blobServer,
+				executor,
+				metricFetcher,
+				highAvailabilityServices.getWebMonitorLeaderElectionService(),
+				fatalErrorHandler);
+
+			log.debug("Starting Dispatcher REST endpoint.");
+			webMonitorEndpoint.start();
+
+			final String hostname = getHostname(rpcService);
+			
+			jobManagerMetricGroup = MetricUtils.instantiateJobManagerMetricGroup(
+				metricRegistry,
+				hostname,
+				ConfigurationUtils.getSystemResourceMetricsProbingInterval(configuration));
+		 	//创建启动 ResourceManager
+			resourceManager = resourceManagerFactory.createResourceManager(
+				configuration,
+				ResourceID.generate(),
+				rpcService,
+				highAvailabilityServices,
+				heartbeatServices,
+				metricRegistry,
+				fatalErrorHandler,
+				new ClusterInformation(hostname, blobServer.getPort()),
+				webMonitorEndpoint.getRestBaseUrl(),
+				jobManagerMetricGroup);
+
+			final HistoryServerArchivist historyServerArchivist = 
+                HistoryServerArchivist.createHistoryServerArchivist(configuration, webMonitorEndpoint);
+			//创建启动 Dispatcher
+			dispatcher = dispatcherFactory.createDispatcher(
+				configuration,
+				rpcService,
+				highAvailabilityServices,
+				resourceManagerGatewayRetriever,
+				blobServer,
+				heartbeatServices,
+				jobManagerMetricGroup,
+				metricRegistry.getMetricQueryServiceGatewayRpcAddress(),
+				archivedExecutionGraphStore,
+				fatalErrorHandler,
+				historyServerArchivist);
+
+			log.debug("Starting ResourceManager.");
+			resourceManager.start();
+			resourceManagerRetrievalService.start(resourceManagerGatewayRetriever);
+
+			log.debug("Starting Dispatcher.");
+			dispatcher.start();
+			dispatcherLeaderRetrievalService.start(dispatcherGatewayRetriever);
+			//返回DispatcherResourceManagerComponent,该组建中包含了启动了的
+            //Dispatcher、ResourceManager和WebMonitorEndpoint服务
+			return createDispatcherResourceManagerComponent(
+				dispatcher,
+				resourceManager,
+				dispatcherLeaderRetrievalService,
+				resourceManagerRetrievalService,
+				webMonitorEndpoint,
+				jobManagerMetricGroup);
+
+		} catch (Exception exception) {
+			// clean up all started components
+			if (dispatcherLeaderRetrievalService != null) {
+				try {
+					dispatcherLeaderRetrievalService.stop();
+				} catch (Exception e) {
+					exception = ExceptionUtils.firstOrSuppressed(e, exception);
+				}
+			}
+
+			if (resourceManagerRetrievalService != null) {
+				try {
+					resourceManagerRetrievalService.stop();
+				} catch (Exception e) {
+					exception = ExceptionUtils.firstOrSuppressed(e, exception);
+				}
+			}
+
+			final Collection<CompletableFuture<Void>> terminationFutures = new ArrayList<>(3);
+
+			if (webMonitorEndpoint != null) {
+				terminationFutures.add(webMonitorEndpoint.closeAsync());
+			}
+
+			if (resourceManager != null) {
+				terminationFutures.add(resourceManager.closeAsync());
+			}
+
+			if (dispatcher != null) {
+				terminationFutures.add(dispatcher.closeAsync());
+			}
+
+			final FutureUtils.ConjunctFuture<Void> terminationFuture = 
+                FutureUtils.completeAll(terminationFutures);
+
+			try {
+				terminationFuture.get();
+			} catch (Exception e) {
+				exception = ExceptionUtils.firstOrSuppressed(e, exception);
+			}
+
+			if (jobManagerMetricGroup != null) {
+				jobManagerMetricGroup.close();
+			}
+
+			throw new FlinkException("Could not create the DispatcherResourceManagerComponent.", exception);
+		}
+	}
+}
+```
+
+
+
+#### TaskManager启动
 
 
 
 ## Yarn Flink集群启动
+
+Yarn Flink集群的启动入口`org.apache.flink.yarn.AbstractYarnClusterDescriptor#deployInternal`。
+
+
 
 # Flink调度与资源管理
 
@@ -4632,16 +5146,19 @@ protected void run(String[] args) throws Exception {
 
 		final Options commandOptions = CliFrontendParser.getRunCommandOptions();
 
-		final Options commandLineOptions = CliFrontendParser.mergeOptions(commandOptions, customCommandLineOptions);
+		final Options commandLineOptions = 
+            CliFrontendParser.mergeOptions(commandOptions, customCommandLineOptions);
 
-		final CommandLine commandLine = CliFrontendParser.parse(commandLineOptions, args, true);
+		final CommandLine commandLine = 
+            CliFrontendParser.parse(commandLineOptions, args, true);
 
 		final RunOptions runOptions = new RunOptions(commandLine);
 		//创建PackagedProgram
 		final PackagedProgram program;
 		program = buildProgram(runOptions);
 
-		final CustomCommandLine<?> customCommandLine = getActiveCustomCommandLine(commandLine);
+		final CustomCommandLine<?> customCommandLine = 
+            getActiveCustomCommandLine(commandLine);
 		//开始运行创建的PackagedProgram
 		runProgram(customCommandLine, commandLine, runOptions, program);
 	}
@@ -4704,8 +5221,10 @@ public class CliFrontend {
 					final ClusterSpecification clusterSpecification = 
                         customCommandLine.getClusterSpecification(commandLine);
 					client = clusterDescriptor.deploySessionCluster(clusterSpecification);
-					// if not running in detached mode, add a shutdown hook to shut down cluster if client exits
-					// there's a race-condition here if cli is killed before shutdown hook is installed
+					// if not running in detached mode, 
+                    // add a shutdown hook to shut down cluster if client exits
+					// there's a race-condition here if cli is killed before 
+                    // shutdown hook is installed
 					if (!runOptions.getDetachedMode() && runOptions.isShutdownOnAttachedExit()) {
 						shutdownHook = 
                             ShutdownHookUtil.addShutdownHook(client::shutDownCluster, 
@@ -4963,7 +5482,9 @@ private CompletableFuture<Void> scheduleLazy(SlotProvider slotProvider) {
 
 
 
-#### LAZY_FROM_SOURCES_WITH_BATCH_SLOT_REQUEST模式（待编写）
+#### LAZY_FROM_SOURCES_WITH_BATCH_SLOT_REQUEST模式
+
+目前该模式的实现与`LAZY_FROM_SOURCES`完全相同，未来会改进实现。
 
 #### EAGER模式
 
@@ -5276,21 +5797,225 @@ StreamTask(OneInputStreamTask、TwoInputStreamTask、StreamIterationHead、Strea
 
 ## 关键对象
 
-### TaskManager
+### JobManagerRunner
 
-TaskManager是flink中资源管理的基本组件，是所有执行任务的基本容器，提供了内存管理、IO管理、通信管理等一系列功能。
+在新版本的Flink中已经没有`JobManager`这个对象，取而代之的是`JobMaster`。`JobManagerRunner`用作启动JobMaster，提供Job级别的leader选举、处理异常，旧的JobManager的逻辑在`JobMaster`中。
+
+### JobMaster
+
+JobMaster负责JobGraph的调度执行。
+
+**继承关系**
+
+![1565145484906](images/1565145484906.png)
+
+如上图所示，JobMaster实现了非常多的接口：
+
+JobMasterService
+
+CheckpointCoordinatorGateway
+
+
+
+#### JobMaster的关键属性
+
+```java
+public class JobMaster extends FencedRpcEndpoint<JobMasterId> implements JobMasterGateway, JobMasterService {
+
+	/** Default names for Flink's distributed components. */
+	public static final String JOB_MANAGER_NAME = "jobmanager";
+
+	// ------------------------------------------------------------------------
+	//JobMaster的配置信息，如RPC请求超时时间、slot请求超时时间、临时目录等等
+	private final JobMasterConfiguration jobMasterConfiguration;
+	//资源标识，用来区分flink的组件
+	private final ResourceID resourceId;
+	//JobGraph
+	private final JobGraph jobGraph;
+
+	private final Time rpcTimeout;
+	//高可用服务
+	private final HighAvailabilityServices highAvailabilityServices;
+	//BlobWriter用来上传数据到BlobServer存储中
+	private final BlobWriter blobWriter;
+	//心跳服务，包含心跳接收和心跳发送
+	private final HeartbeatServices heartbeatServices;
+
+	private final JobManagerJobMetricGroupFactory jobMetricGroupFactory;
+
+	private final ScheduledExecutorService scheduledExecutorService;
+
+	private final OnCompletionActions jobCompletionActions;
+
+	private final FatalErrorHandler fatalErrorHandler;
+
+	private final ClassLoader userCodeLoader;
+	//Slot资源管理，响应ExecutionGraph的Slot请求，如果Slot不足，则负责从ResourceManager请求新的Slot。
+  	private final SlotPool slotPool;
+	//
+	private final Scheduler scheduler;
+
+	private final SchedulerNGFactory schedulerNGFactory;
+
+	// --------- 反压状态跟踪 --------
+
+	private final BackPressureStatsTracker backPressureStatsTracker;
+
+	// --------- ResourceManager --------
+
+	private final LeaderRetrievalService resourceManagerLeaderRetriever;
+
+	// --------- TaskManagers --------
+
+	private final Map<ResourceID, Tuple2<TaskManagerLocation, TaskExecutorGateway>> registeredTaskManagers;
+	
+    //Intermediate result partition注册，好像已经没有用了
+	private final ShuffleMaster<?> shuffleMaster;
+
+	// -------- Mutable fields ---------
+	//与TaskManager之间的心跳
+	private HeartbeatManager<AccumulatorReport, AllocatedSlotReport> taskManagerHeartbeatManager;
+	//与ResourceManager之间的心跳
+	private HeartbeatManager<Void, Void> resourceManagerHeartbeatManager;
+	//Job的调度
+	private SchedulerNG schedulerNG;
+	//Job状态监听器
+	@Nullable
+	private JobManagerJobStatusListener jobStatusListener;
+	//当前job的MetricGroup
+	@Nullable
+	private JobManagerJobMetricGroup jobManagerJobMetricGroup;
+	//ResourceManager地址和Leader的FenceToken
+	@Nullable
+	private ResourceManagerAddress resourceManagerAddress;
+	
+	@Nullable
+	private ResourceManagerConnection resourceManagerConnection;
+
+	@Nullable
+	private EstablishedResourceManagerConnection establishedResourceManagerConnection;
+
+	private Map<String, Object> accumulators;
+	//partition跟踪，当具备partition释放条件时，向TaskExecutor和ShuffleMaster发出释放请求
+	private final PartitionTracker partitionTracker;
+}
+```
+
+
+
+#### JobMaster行为
+
+JobMaster主要提供了如下行为：
+
+1. ExecutionGraph的调度执行和管理
+
+   主要交给`SchedulerNG`类具体执行。
+
+   包括Job的启动、挂起、失败
+
+2. 资源管理
+
+   Slot的申请、提供、失败处理。
+
+   与`ResourceManager`之间的连接管理、心跳维持等。
+
+3. TaskManager管理
+
+   TM注册、
+
+4. 调度分配
+
+5. BackPressure控制
+
+6. Job管理
+
+   Job状态管理、对外提供Job状态信息。
+
+7. checkpoint、savepoint管理
+
+   checkpoint的触发和中断、确认。
+
+   savepoint的触发。
+
+### SchedulerNG
+
+
+
+SchedulerNG是个代理类，定义了一些列的调度、管理行为，用来将`JobMaster`中的对Job管理、Job执行调度行为代理给`ExecutionGraph`。
+
+**继承关系**
+
+![1565147725493](images/1565147725493.png)
+
+`LegacyScheduler`是Flink的目前实现，未来批流合一之后会有针对性的改进，使用`DefaultScheduler`，目前DefaultScheduler尚未实现。
+
+最终的调度逻辑在`SchedulingUtils`中实现，提供了EAGER和LAZY_FROM_SOURCE两种调度逻辑，具体细节参见《Flink调度与资源管理--调度》章节。
+
+### TaskManager（TaskExecutor）
+
+#### TaskManager的属性
+
+`TaskManager`是旧版本flink中的叫法，现在的核心实现类是`TaskExecutor.java`资源管理的基本组件，是所有执行任务的基本容器，提供了内存管理、IO管理、通信管理等一系列功能。
 
 - **MemoryManager**
 
-​       JVM普遍存在着存储对象密度低、大内存时GC对系统影响大等问题。所以flink自己抽象了一套内存管理机制，将所有对象序列化后放在自己的MemorySegment上进行管理。
+​       JVM普遍存在着存储对象密度低、大内存时GC对系统影响大等问题。所以flink自己抽象了一套内存管理机制，将所有对象序列化后放在自己的`MemorySegment`上进行管理。
 
 - **IOManager**
 
-​       flink通过IOManager管理磁盘IO的过程，提供了同步和异步两种写模式，又进一步区分了block、buffer和bulk三种读写方式。
+​       flink通过`IOManager`管理磁盘IO的过程，提供了同步和异步两种写模式，又进一步区分了block、buffer和bulk三种读写方式。
 
 - **NettyShuffleManager**（以前叫**NetworkEnvironment**）
 
-​        TaskManager的网络 IO 组件，包含了追踪中间结果和数据交换的数据结构。它的构造器会统一将配置的内存先分配出来，抽象成 NetworkBufferPool 统一管理内存的申请和释放。意思是说，在输入和输出数据时，不管是保留在本地内存，等待chain在一起的下个操作符进行处理，还是通过网络把本操作符的计算结果发送出去，都被抽象成了NetworkBufferPool。
+​        `TaskManager`的网络 IO 组件，包含了追踪中间结果和数据交换的数据结构。它的构造器会统一将配置的内存先分配出来，抽象成 `NetworkBufferPool` 统一管理内存的申请和释放。意思是说，在输入和输出数据时，不管是保留在本地内存，等待chain在一起的下个操作符进行处理，还是通过网络把本操作符的计算结果发送出去，都被抽象成了`NetworkBufferPool`。
+
+- **FileCache**
+
+  文件缓存，用来在`TaskManager`的本地缓存从`Application Master`的`BlobService`取到的文件，存储路径如下：
+
+  ```bat
+  <system-tmp-dir>/tmp_<jobID>/
+  ```
+
+- **HearbeatManager**
+
+  心跳管理器，有两个JobManager心跳管理器和ResourceManager心跳管理器，负责与JM和RM维持心跳信息，并且在心跳信息中传递状态等数据。
+
+#### TaskManager的行为
+
+**对外行为**，可以通过TaskExecutorGateway进行远程调用
+
+1. **Slot管理**
+
+   申请、释放slot。
+
+2. **Checkpoint管理**
+
+   接受Checkpoint的触发、确认Checkpoint完成。
+
+3. **task管理**
+
+   接收JM的发布的task、执行task、取消task、销毁task。
+
+4. **与JM和RM的远程通讯**
+
+   与JM、RM维持连接和心跳。
+
+5. **分区管理行为**
+
+   更新TaskManager partition、释放partition。
+
+6. **TaskManager是否可释放**
+
+   用来判断TaskExecutor是否可以回收掉。
+
+**内部行为**
+
+1. 生命周期管理
+
+   启动和停止
+
+2. 
 
 ### StreamTask
 
@@ -13377,6 +14102,18 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends AbstractActor {
   ```
 
   
+
+# 附录
+
+## 术语说明
+
+**Application Master**
+
+Flink 作业管理、调度、外部访问、提供Web UI服务的进程，进程中运行了JobManager、Dispatcher、ResourceManager、BlobServer等多种组件。很多时候沿袭了之前的叫做，仍然把Application Master叫做JobManager，并且在启动脚本中也是这么叫的，在Flink的java代码中已经逐渐移除了JobManager的一些代码。
+
+**JobManager**
+
+新版本的Flink中每个JobManager对应于一个Job，为Job提供资源的申请、执行调度、checkpoint协调、异常处理等功能。JobManager实际上现在包装了JobMaster，JobMaster是行为的实际执行者。
 
 
 
