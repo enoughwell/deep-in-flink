@@ -14,10 +14,181 @@
 
 # Flink入门
 
-## Flink可以做什么
-## Flink的应用场景
-## Flink生态
-## Flink技术栈
+## Flink是什么
+
+​		Apache Flink是一个用于对无限和有限数据流进行有状态计算的框架和分布式处理引擎。Flink设计为运行在所有常见的集群环境中，并且以内存速度和任意规模执行计算。
+
+  在这里，我们解释Flink架构的相关重要内容。
+
+### 处理无限和有限数据
+
+  任何类型的数据都是作为事件流产生的。信用卡交易事务，传感器测量，机器日志以及网站或移动应用程序上的用户交互行为，所有这些数据都生成流。
+
+  数据可以作为有限或无限数据流处理。
+
+1. **无限数据流**
+
+   无线数据流一旦开始就会持续产生，除非认为中止。所以必须持续地处理无限数据流，即必须在获取到事件后立即处理它。不能等待所有输入数据到达后处理，因为输入是无限的，没有终止的事件。处理无限数据通常要求以特定顺序（例如事件发生的顺序）获取，以便能够判断事件是否到齐，有无遗漏。
+
+2. **有限数据流**
+
+   有开始有结束的数据集。可以在执行任何计算之前通过拉取到所有数据后处理有限数据流。处理有限流不需要考虑数据处理的顺序，因为可以随时对有限数据集进行排序。有限数据流的处理也称为**批处理**。
+
+   ![img](images/bounded-unbounded.png)
+
+
+
+**flink擅长处理有限和无限的数据集。**精确控制时间和状态可以使flink能够处理任何种类的无限数据流，Flink专门设计了算法和数据结构来高效的处理有限数据流，性能非常不错。
+
+### 多平台部署
+
+​		Apache Flink是一个分布式系统，需要计算资源才能执行应用程序。Flink与所有常见的集群资源管理器（如Hadoop YARN，Apache Mesos和Kubernetes）集成，也可以作为独立集群运行。
+
+  Flink设计了一套资源管理框架，针对上边提到的资源管理平台实现了对应的资源管理（ResourceManager)，能够与上边提到的资源管理平台无缝对接。
+
+  部署Flink应用程序时，Flink会根据应用程序配置的**并行度**自动识别所需资源，并向资源管理器申请资源。如果发生故障，Flink会通过请求新的资源来替换发生故障的资源。Flink提供了提交或控制应用程序REST接口，方便与外部的应用与Flink进行集成。
+
+### 运行任意规模的分布式计算应用
+
+​		Flink的目标支撑任意规模运行有状态流式应用程序。应用程序可以在集群中分拆成几千个并行计算的任务。因此，应用程序可以利用几乎无限量的CPU，内存，磁盘和网络IO。同时，Flink可以轻松维护非常大的应用程序的状态。其**异步和增量检查点算法**确保对延迟处理的影响最小，同时保证精确一次的状态一致性。
+
+ Flink的一些用户在其生产环境中运行的Flink应用程序，规模非常大，如下所示：
+
+- 应用程序每天处理数万亿个事件
+- 应用程序维护几个TB的状态
+- 应用程序使用了几千个CPU核
+
+### 充分利用内存的性能
+
+​		有状态的Flink应用程序针对本地状态访问进行了优化。任务状态始终驻留在**内存**中，或者，如果状态大小超过可用内存，则保存在**访问高效的磁盘**上的数据结构中。因此，任务通过访问本地（通常是内存中）状态来执行所有计算，从而达到特别低的处理延迟。Flink通过定期和异步检查点将本地状态到持久存储来保证在出现故障时的精确一次的状态一致性。
+
+![img](images/local-state.png)
+
+### 流计算应用程序
+
+#### 有状态计算
+
+每个流式应用都是有状态的。只有对个别事件应用转换的应用程序才不需要状态。运行基本业务逻辑的任何应用程序都需要记住事件或中间结果，以便在之后的时间点访问它们，例如在收到下一个事件时或在特定持续时间之后。
+
+![img](images/function-state.png)
+
+​	应用程序的状态在Flink中是一等公民。您可以通过查看Flink在状态处理环境（上下文context）中提供的所有功能（函数）来查看。
+  
+
+- **多状态原语**
+
+  Flink为不同的数据结构提供了状态原语，如单值(value)，List或Map。开发人员可以根据函数的访问模式选择最有效的状态原语。
+
+- **可插拔状态后端**
+
+  应用程序状态由可插拔状态后端管理以及检查(checkpointed)。Flink有不同的状态后端，可以在内存或RocksDB中存储状态，RocksDB(KV DB)是一种高效的嵌入式磁盘数据存储。也可以插入自定义状态后端。
+
+- **精确一次的状态一致性**
+
+  Flink的检查点和恢复算法可确保在发生故障时应用程序状态的一致性。因此，故障是透明处理的，不会影响应用程序的正确性。
+
+- **非常大的状态**
+
+  由于其异步和增量检查点算法，Flink能够维持几个TB的应用程序状态。
+
+- **可扩展的应用程序**
+
+   Flink通过将状态重新分配给更多或更少的Worker节点来支持有状态应用程序的扩展。
+
+#### 时间语义
+
+  时间是流式应用的另一个重要组成成分。大多数事件流都具有固定的时间语义，因为每个事件都是在特定的时间点生成的。此外，许多常见的流计算基于时间，例如窗口聚合、会话化、模式监测和基于时间的连接。流处理的一个重要方面是应用程序如何测量时间，即时间时间和处理时间之间的差异。
+
+  Flink提供了一组丰富的与时间相关的功能。
+
+- **事件时间模式**
+
+  使用**事件时间**语义处理流的应用程序根据事件的时间戳计算结果。因此，无论是处理实时的事件还是延后处理，使用事件时间能够保证处理结果的精确和一致。
+
+- **Watermark**
+
+  Flink使用水印来Watermark事件时间应用中的时间。Watermark也是一种灵活的机制，可以权衡取舍处理延迟和结果的完整性。
+
+- **延迟数据处理**
+
+  当在事件时间模式下使用水印处理流时，可能会发生在所有相关事件到达之前已完成计算的情况。这类事件被称为延迟事件。Flink具有多种处理延迟事件的选项，例如通过边输出重新路由它们以及更新之前已经完成的结果。
+
+- **处理时间模式**
+
+  除了**事件时间**模式以外，Flink还支持**处理时间**语义，**处理时间**语义的执行由处理机器的系统时钟为准来触发计算。处理时间模式适用于某些具有严格的低延迟要求的应用，这些要求同时可以容忍近似结果。
+
+### 运维
+
+Apache Flink是一个用于对无边界和有边界数据流进行有状态计算的框架。由于许多流应用程序设计为以最短的停机时间连续运行，因此流处理器必须提供出色的故障恢复，以及在应用程序运行时监控和维护应用程序的工具。
+  Apache Flink非常关注流处理的操作方面。在这里，我们将解释Flink的故障恢复机制，并介绍其管理和监督正在运行的应用程序的特性。
+
+#### 7*24运行
+
+  机器和处理故障在分布式系统中无处不在。像Flink这样的分布式流处理器必须从故障中恢复，以便能够全天候运行流应用程序。显然，这不仅意味着在故障发生后重新启动应用程序，而且还要确保其内部状态保持一致，以便应用程序可以继续处理，就像从未发生过故障一样。
+  Flink提供了多种特性，以确保应用程序保持运行并保持一致：
+
+- **一致的检查点**：Flink的恢复机制基于应用程序状态的一致性检查点。如果发生故障，将重新启动应用程序并从最新检查点加载其状态。结合可重置的流源，此特性可以保证精确一次的状态一致性。
+- **高效的检查点**：如果应用程序保持TB级的状态，则检查应用程序的状态可能非常昂贵。Flink可以执行异步和增量检查点，以便将检查点对应用程序的延迟SLAs的影响保持在非常小的水平。
+- **End-to-End精确一次**：Flink为特定存储系统提供事务接收(sink)器，保证数据只写出一次，即使出现故障。
+- **与集群管理器集成**：Flink与集群管理器紧密集成，例如Hadoop YARN，Mesos或Kubernetes。当进程失败时，将自动启动一个新进程来接管它的工作。
+- **高可用性设置**：Flink具有高可用性模式特性，可消除所有单点故障。HA模式基于Apache ZooKeeper--是一种经过验证的可靠分布式协调服务。
+
+#### 更新，迁移，暂停和恢复应用程序
+
+​		需要维护为关键业务服务提供支持的流应用程序。需要修复错误，并且需要实现改进或新功能特性。但是，更新有状态流应用程序并非易事。通常，我们不能简单地停止应用程序并重新启动固定版本或改进版本，因为无法承受丢失应用程序的状态。
+  Flink的Savepoints是一个独特而强大的功能特性，可以解决更新有状态应用程序和许多其他相关挑战的问题。保存点是应用程序状态的一致快照，因此它与检查点非常相似。但是，与检查点相比，需要手动触发保存点，并且在应用程序停止时不会自动删除保存点。保存点可用于启动状态兼容的应用程序并初始化其状态。保存点可启用以下功能：
+
+- **应用程序演变**
+
+  保存点可用于发展应用程序。可以从从先前版本的应用程序中获取的保存点重新启动应用程序的固定或改进版本。也可以从较早的时间点（假设存在这样的保存点）启动应用程序，以修复由有缺陷的版本产生的错误结果。
+
+- **集群迁移**
+
+  使用保存点，可以将应用程序迁移（或克隆）到不同的集群。
+
+- **Flink版本更新**
+
+  可以使用保存点迁移应用程序在Flink的新版本上运行。
+
+- **应用程序扩展**
+
+  保存点可用于增加或减少应用程序的并行性。
+
+- **A / B测试和假设情景**
+
+  通过在同一保存点启动应用程序的所有版本，可以比较两个（或更多）不同版本的应用程序的性能或质量。
+
+- **暂停和恢复**
+
+  可以通过获取保存点来暂停应用程序并停止它。在以后的任何时间点，都可以从保存点恢复应用程序。
+
+- **归档**
+
+- 保存点可以存档，以便能够将应用程序的状态重置为较早的时间点。
+
+#### 应用的监控和控制
+
+  与任何其他服务一样，持续运行的流应用程序需要受到监督并集成到组织的运营（operations）基础架构（即监控和日志记录服务）中。监控有助于预测问题并提前做出反应。日志记录让我们可以依据根原因分析来调查故障。最后，控制运行应用程序的易于访问的界面也是一个重要特性。
+
+  Flink与许多常见的日志记录和监视服务已经很好地集成，并提供REST API来控制应用程序和查询信息。
+
+- **Web UI**
+
+  Flink拥有Web UI功能特性，可以检查，监视和调试正在运行的应用程序。它还可用于提交执行或取消执行。
+
+- **Logging**
+
+  Flink实现了流行的slf4j日志记录接口，并与日志框架log4j或logback集成。
+
+- **Metrics**
+
+  Flink具有复杂的度量标准系统，用于收集和报告系统和用户定义的度量标准。度量标准可以导出到几个reporters，包括JMX，Ganglia，Graphite，Prometheus，StatsD，Datadog和Slf4j。
+
+- **REST API**
+
+  Flink暴露公开提交新应用程序，获取正在运行的应用程序的保存点或取消应用程序的REST API。REST API还公开元数据、收集到的正在运行的或已完成应用程序的指标
+
+## Flink生态与技术栈
 
 ![img](./images/flink-ecosystem.png)
 
@@ -35,27 +206,27 @@
 
 - **Libraries层**
 
-  该层也可以称为Flink应用框架层，根据API层的划分，在API层之上构建的满足特定应用的实现计算框架，也分别对应于面向流处理和面向批处理两类。面向流处理支持：CEP（复杂事件处理）、基于SQL-like的操作（基于Table的关系操作）；面向批处理支持：FlinkML（机器学习库）、Gelly（图处理）
+  该层也可以称为Flink应用框架层，根据API层的划分，在API层之上构建的满足特定应用的实现计算框架，也分别对应于面向流处理和面向批处理两类。面向流处理支持：CEP（复杂事件处理）、基于SQL-like的操作（基于Table的关系操作）；面向批处理支持：FlinkML（机器学习库）、Gelly（图处理）。
 
-## Flink抽象层次
+### Flink API抽象层次
 
 ![img](./images/flink-abstract-layer.svg)
 
 - **Stateful Streaming Processing**
 
-  最底层。它通过Process Function嵌入到DataStream API中。它允许用户从一个或多个流自由处理事件，并使用一致的容错状态。此外，用户可以注册事件时间和处理时间回调，允许程序实现复杂的计算。
+  [ProcessFunctions](https://ci.apache.org/projects/flink/flink-docs-stable/dev/stream/operators/process_function.html)是Flink提供的最具表现力的功能接口。Flink提供ProcessFunctions来处理来自一个或两个输入流中的单个事件或分组到一个窗口的事件。ProcessFunctions提供对时间和状态的细粒度控制。ProcessFunction可以任意修改其状态并注册将在未来触发回调函数的定时器。因此，ProcessFunctions可以实现许多有状态事件驱动应用程序所需的复杂的每个事件业务逻辑。
 
-- **Core APIs**
+- **Core APIs(DataStream/DataSet API)**
 
-  实际上，大多数应用程序不需要上述的低级别抽象，而是针对Core API（如DataStream API（有界/无界流））和DataSet API（有界数据集）进行编程。这些流畅的API为数据处理提供了常见的构建模块，如用户指定的各种转换形式，连接，聚合，窗口，状态等。在这些API中处理的数据类型以各自的编程语言表示为classes。底层的Process Function和DataStream API的整合，使得针对一些特定的操作可以实现更低层次的抽象。DataSet API为有界数据集提供了额外的原函数，如循环/迭代。
+  实际上，大多数应用程序不需要上述的低级别抽象，而是针对Core API（如DataStream API（有限/无限流））和DataSet API（有限数据集）进行编程。Fluent风格API为数据处理提供了常见的构建模块，如用户指定的各种转换形式，连接，聚合，窗口，状态等。在这些API中处理的数据类型以各自的编程语言表示为classes。底层的Process Function和DataStream API的整合，使得针对一些特定的操作可以实现更低层次的抽象。DataSet API为有限数据集提供了额外的原函数，如循环/迭代。
 
 - **Table API**
 
-  Table API是以表为中心的声明式DSL，可能是动态更改表（表示流时）。Table API遵循（扩展）关系模型：Table 具有附加schema（与关系数据库中的表相似），API提供操作，例如select，project，join，group-by，aggregate等。Table API代表的是应该做什么逻辑操作，而不是直接指定如何编写操作的源代码。虽然Table API可以通过各种类型的用户定义的函数进行扩展，但它不如Core API那么具有表达力，但使用起来更加简洁（少写很多代码）。
+  Table API是以表为中心的声明式DSL，可能是动态更改表（表示流时）。Table API遵循（扩展）关系模型：Table 有schema（与关系数据库中的表相似），API提供操作，例如select，project，join，group-by，aggregate等。Table API代表的是应该做什么逻辑操作，而不是直接指定如何编写操作的源代码。Table API可以通过各种类型的用户定义的函数进行扩展，虽然不如Core API表达能力强，但使用起来更加简洁（少写很多代码）。
 
-  此外，Table API程序还可以通过在执行之前应用优化规则的优化器。
+  此外，Table API程序还可以通过在执行之前使用SQL优化器进行优化。
 
-  可以在表和DataStream / DataSet之间无缝转换，允许程序将Table API和DataStream和DataSet API混合使用。
+  可以在表和DataStream / DataSet之间无缝转换，允许程序将Table API和DataStream/DataSet API混合使用。
 
 - **SQL**
 
@@ -85,6 +256,22 @@
   
     很多不同行业不同领域的人都懂 SQL，SQL 的学习门槛很低，用 SQL 作为跨团队的开发语言可以很大地提高效率。
 
+### 库（Libraries）
+
+Flink具有几个用于常见数据处理用例的库。这些库通常嵌入在API中，而不是完全独立的。因此，它们可以从API的所有特性中受益，并与其他库集成。
+
+- **复杂事件处理（CEP）**
+
+  模式检测是事件流处理中的一个非常常见的用例。Flink的CEP库提供了一个API来指定事件模式（如正则表达式或状态机）。CEP库与Flink的DataStream API集成，以便在DataStream上评估模式。CEP库的应用包括网络***检测，业务流程监控和欺诈检测。
+
+- **DataSet API**
+
+  DataSet API是Flink用于批处理应用程序的核心API。DataSet API的原语包括 map,reduce,(outer)join,co-group和iterate。所有操作都由算法和数据结构支持，这些算法和数据结构对内存中的序列化数据进行进行操作，如果数据大小超过内存预算则溢出到磁盘。Flink的DataSet API的数据处理算法收到传统数据库运算符的启发，例如混合散列连接或外部合并排序（ hybrid hash-join or external merge-sort）。
+
+- **Gelly**
+
+  Gelly是一个可扩展的图形处理和分析库。Gelly是在DataSet API之上实现的，并与DataSet API集成在一起。因此，它受益于其可扩展且强大的操作符。Gelly具有[内置算法](https://ci.apache.org/projects/flink/flink-docs-stable/dev/libs/gelly/library_methods.html)，如label propagation(标签传播), triangle enumeration, and page rank, 但也提供了一个自定义图算法实现的简化[Graph API](https://ci.apache.org/projects/flink/flink-docs-stable/dev/libs/gelly/graph_api.html)。
+
 ## Flink运行架构
 
 ![img](./images/flink-run-architecture.svg)
@@ -101,7 +288,7 @@ Flink程序的基本构建块是流和转换。在概念上，stream 是data rec
 
 ​	2)	加载/创建初始数据
 
-​	3)	指定对此数据的转换**
+​	3)	指定对此数据的转换
 
 ​	4)	指定计算结果的位置
 
@@ -5773,7 +5960,7 @@ TASK::invoke
 
 ### JobManager分发Task
 
-在JobMaster中
+在`JobMaster`中从`JobGraph`生成`ExecutionGraph`之后，开始调度Job执行。
 
 ```java
 //JobMaster.java
@@ -5789,16 +5976,16 @@ private void startScheduling() {
 
 //LegacyScheduler.java
 @Override
-	public void startScheduling() {
-		mainThreadExecutor.assertRunningInMainThread();
+public void startScheduling() {
+    mainThreadExecutor.assertRunningInMainThread();
 
-		try {
-			executionGraph.scheduleForExecution();
-		}
-		catch (Throwable t) {
-			executionGraph.failGlobal(t);
-		}
-	}
+    try {
+        executionGraph.scheduleForExecution();
+    }
+    catch (Throwable t) {
+        executionGraph.failGlobal(t);
+    }
+}
 
 //ExecutionGraph.java
 public void scheduleForExecution() throws JobException {
@@ -11359,11 +11546,12 @@ reduce useless aggCall
 
 ```scala
  /**
-    * RuleSet to translate calcite nodes to flink nodes
+    *将Calcite逻辑节点RelNode树转换为Flink逻辑节点RelNode树。
     */
   private val LOGICAL_CONVERTERS: RuleSet = RuleSets.ofList(
-    // translate to flink logical rel nodes
+
     FlinkLogicalAggregate.STREAM_CONVERTER,
+    FlinkLogicalTableAggregate.CONVERTER,
     FlinkLogicalOverAggregate.CONVERTER,
     FlinkLogicalCalc.CONVERTER,
     FlinkLogicalCorrelate.CONVERTER,
@@ -11384,7 +11572,7 @@ reduce useless aggCall
   )
 ```
 
-顾名思义将Calcite逻辑节点树转换为Flink的物理节点树。
+顾名思义将Calcite逻辑节点RelNode树转换为Flink逻辑节点RelNode树。
 
 ##### 流上的逻辑优化规则总集
 
@@ -11544,6 +11732,7 @@ Planner规则，对于包含**distinct**的聚合，例如 **count distinct**，
     StreamExecExpandRule.INSTANCE,
     // group agg
     StreamExecGroupAggregateRule.INSTANCE,
+    StreamExecGroupTableAggregateRule.INSTANCE,
     // over agg
     StreamExecOverAggregateRule.INSTANCE,
     // window agg
@@ -11668,6 +11857,10 @@ Planner规则，对于包含**distinct**的聚合，例如 **count distinct**，
 - **StreamExecGroupAggregateRule.INSTANCE**
 
   将`FlinkLogicalAggregate`转换为`StreamExecGroupAggregate`。
+  
+- **StreamExecGroupTableAggregateRule.INSTANCE**
+
+  将`FlinkLogicalTableAggregate`转换为`StreamExecGroupTableAggregate`。
 
 **over agg**
 
@@ -13444,35 +13637,7 @@ Flink提供了TSL/SSL的支持，能够认证和加密Flink集群内与外部交
 
 参见《[配置SSL](https://ci.apache.org/projects/flink/flink-docs-master/ops/security-ssl.html#configuring-ssl)》。
 
-# Flink性能调优（待编写）
 
-
-
-# Flink生产环境注意事项
-
-## 明确的设定并行度（待编写）
-
-
-
-## 设定Operator的UUID
-
-在State原理章节中，提到过Savepoint和Checkpoint，用户最好为每个Operator设定UID。在从savepoint恢复的时候，Flink使用UID进行快照和Job Operator之间的映射，同一个UID的快照内容，恢复到该UID的Operator中，如果UID改变了，就可能存在无法恢复、部分恢复，无法恢复意味着需要重新处理，部分恢复之后的数据处理结果是错的，无论哪一种都会导致处理结果的异常。
-
-## 选择合适的状态Backend
-
-目前，Flink Job在恢复的时候，不能不能从不同的StateBackend读取保存的保存点。例如，使用MemoryBackend保存了保存点savepoint，将job修改为使用RocksDB StateBackend，Job从保存点savepoint恢复。
-
-> Flink未来的计划中打算将不同的状态Backend统一起来，允许不同的State Backend相互兼容，但是目前还不行。
-
-一般来说，建议使用RocksdDB作为状态Backend，目前RocksDB是唯一支持超大状态的、异步、增量checkpoint的方式。FSStateBackend虽然也可以保存大状态，但是仍受限于TaskManager的内存容量，并且FSStateBackend不支持增量Checkpoint，有可能导致保存状态的花费太长的时间，导致状态保存失败。异步快照的好处是可以不阻塞Flink数据流，保持持续的数据处理，增大吞吐量。
-
-RockDB StateBackend支持大状态的代价是相比内存型的状态，性能会降低，对状态的读取和写入需要频繁的磁盘操作。如果可以确定不会超过内存的容量，保存快照的时候采用同步方式带来的数据流处理的阻断也不会有很大影响的情况下，可以考虑使用其他的StateBackend，如FSStateBackend。
-
-## 配置JobManager高可用
-
-JobManager在Flink集群中负责Job的调度执行和资源管理，是极其重要的组件。默认情况下JobManager是单点的，可能导致单点失败的问题（SPOF），JobManager组件不可用之后，无法发布新的Job并且所有的正在运行的作业也会出错。
-
-<font color=red>所以在生产环境强烈建议配置JobManager的高可用。</font>
 
 
 
@@ -14323,6 +14488,36 @@ class AkkaRpcActor<T extends RpcEndpoint & RpcGateway> extends AbstractActor {
   ```
 
   
+
+# Flink性能调优（待编写）
+
+
+
+# Flink生产环境注意事项
+
+## 明确的设定并行度（待编写）
+
+
+
+## 设定Operator的UUID
+
+在State原理章节中，提到过Savepoint和Checkpoint，用户最好为每个Operator设定UID。在从savepoint恢复的时候，Flink使用UID进行快照和Job Operator之间的映射，同一个UID的快照内容，恢复到该UID的Operator中，如果UID改变了，就可能存在无法恢复、部分恢复，无法恢复意味着需要重新处理，部分恢复之后的数据处理结果是错的，无论哪一种都会导致处理结果的异常。
+
+## 选择合适的状态Backend
+
+目前，Flink Job在恢复的时候，不能不能从不同的StateBackend读取保存的保存点。例如，使用MemoryBackend保存了保存点savepoint，将job修改为使用RocksDB StateBackend，Job从保存点savepoint恢复。
+
+> Flink未来的计划中打算将不同的状态Backend统一起来，允许不同的State Backend相互兼容，但是目前还不行。
+
+一般来说，建议使用RocksdDB作为状态Backend，目前RocksDB是唯一支持超大状态的、异步、增量checkpoint的方式。FSStateBackend虽然也可以保存大状态，但是仍受限于TaskManager的内存容量，并且FSStateBackend不支持增量Checkpoint，有可能导致保存状态的花费太长的时间，导致状态保存失败。异步快照的好处是可以不阻塞Flink数据流，保持持续的数据处理，增大吞吐量。
+
+RockDB StateBackend支持大状态的代价是相比内存型的状态，性能会降低，对状态的读取和写入需要频繁的磁盘操作。如果可以确定不会超过内存的容量，保存快照的时候采用同步方式带来的数据流处理的阻断也不会有很大影响的情况下，可以考虑使用其他的StateBackend，如FSStateBackend。
+
+## 配置JobManager高可用
+
+JobManager在Flink集群中负责Job的调度执行和资源管理，是极其重要的组件。默认情况下JobManager是单点的，可能导致单点失败的问题（SPOF），JobManager组件不可用之后，无法发布新的Job并且所有的正在运行的作业也会出错。
+
+<font color=red>所以在生产环境强烈建议配置JobManager的高可用。</font>
 
 # 附录
 
