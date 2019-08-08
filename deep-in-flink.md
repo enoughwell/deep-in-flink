@@ -3950,7 +3950,7 @@ private void addEdgeInternal(Integer upStreamVertexID, Integer downStreamVertexI
 
 **Stream Operator总体继承关系**
 
-![1563847919329](images/1563847919329.png)
+![1563847919329](./images/1563847919329.png)
 
 > 上图放大看
 >
@@ -4021,7 +4021,7 @@ private void addEdgeInternal(Integer upStreamVertexID, Integer downStreamVertexI
 
 **3个抽象类**
 
-![1563849675998](images/1563849675998.png)
+![1563849675998](./images/1563849675998.png)
 
 如上图所示的继承关系
 
@@ -4089,7 +4089,7 @@ StreamInputProcessor.processInput()从InputGate读取数据，然后调用Stream
 
 #### StreamTransformation、StreamOperator、UDF的关系
 
-![1560329270219](/images/1560329270219.png)
+![1560329270219](./images/1560329270219.png)
 
 #### 实体StreamNode和虚拟StreamNode
 
@@ -4099,7 +4099,7 @@ StreamInputProcessor.processInput()从InputGate读取数据，然后调用Stream
 
 如下图所示的转换树所示
 
-![1560332101843](/images/1560332101843.png)
+![1560332101843](./images/1560332101843.png)
 
 
 
@@ -4335,7 +4335,7 @@ private List<StreamEdge> createChain(
 
 如下图所示
 
-![1560394979197](/images/1560394979197.png)
+![1560394979197](./images/1560394979197.png)
 
 **可以Chain的条件**
 
@@ -4492,27 +4492,27 @@ ExecutionJobVertex方法，用来将一个个JobVertex封装成ExecutionJobVerte
 (1)  如果并发数等于`partition`数，则一对一进行连接。如下图所示：
  即`numSources == parallelism`
 
-![img](/images/10507536-9274be995a382392.png)
+![img](./images/10507536-9274be995a382392.png)
 
 (2)  如果并发数大于`partition`数，则一对多进行连接。如下图所示：
 即`numSources < parallelism`，且`parallelism % numSources == 0`
 
-![img](/images/10507536-76cf412fd1531087.png)
+![img](./images/10507536-76cf412fd1531087.png)
 
 
 
  即`numSources < parallelism`，且`parallelism % numSources != 0`
 
-![img](/images/10507536-75a151d59a3981bf.png)
+![img](./images/10507536-75a151d59a3981bf.png)
 
 (3) 如果并发数小于`partition`数，则多对一进行连接。如下图所示：
 即`numSources > parallelism`，且`numSources % parallelism == 0`
 
-![img](/images/10507536-646304409b42b06d.png)
+![img](./images/10507536-646304409b42b06d.png)
 
 即`numSources > parallelism`，且`numSources % parallelism != 0`
 
-![img](/images/10507536-9955c154f6e1bff6.png)
+![img](./images/10507536-9955c154f6e1bff6.png)
 
 ### 总结
 
@@ -5771,7 +5771,228 @@ TASK::invoke
 
 ## Job的启动
 
-### JobManager启动Task
+### JobManager分发Task
+
+在JobMaster中
+
+```java
+//JobMaster.java
+
+private void startScheduling() {
+    checkState(jobStatusListener == null);
+    // register self as job status change listener
+    jobStatusListener = new JobManagerJobStatusListener();
+    schedulerNG.registerJobStatusListener(jobStatusListener);
+
+    schedulerNG.startScheduling();
+}
+
+//LegacyScheduler.java
+@Override
+	public void startScheduling() {
+		mainThreadExecutor.assertRunningInMainThread();
+
+		try {
+			executionGraph.scheduleForExecution();
+		}
+		catch (Throwable t) {
+			executionGraph.failGlobal(t);
+		}
+	}
+
+//ExecutionGraph.java
+public void scheduleForExecution() throws JobException {
+
+    assertRunningInJobMasterMainThread();
+
+    final long currentGlobalModVersion = globalModVersion;
+
+    if (transitionState(JobStatus.CREATED, JobStatus.RUNNING)) {
+
+        final CompletableFuture<Void> newSchedulingFuture = SchedulingUtils.schedule(
+            scheduleMode,
+            getAllExecutionVertices(),
+            this);
+
+        if (state == JobStatus.RUNNING && currentGlobalModVersion == globalModVersion) {
+            schedulingFuture = newSchedulingFuture;
+            newSchedulingFuture.whenComplete(
+                (Void ignored, Throwable throwable) -> {
+                    if (throwable != null) {
+                        final Throwable strippedThrowable =
+                            ExceptionUtils.stripCompletionException(throwable);
+
+                        if (!(strippedThrowable instanceof CancellationException)) {
+                            // only fail if the scheduling future was not canceled
+                            failGlobal(strippedThrowable);
+                        }
+                    }
+                });
+        } else {
+            newSchedulingFuture.cancel(false);
+        }
+    }
+    else {
+        throw new IllegalStateException("Job may only be scheduled from state " + JobStatus.CREATED);
+    }
+}
+//SchedulingUtils.java
+public static CompletableFuture<Void> schedule(
+			ScheduleMode scheduleMode,
+			final Iterable<ExecutionVertex> vertices,
+			final ExecutionGraph executionGraph) {
+
+    switch (scheduleMode) {
+        case LAZY_FROM_SOURCES:
+        case LAZY_FROM_SOURCES_WITH_BATCH_SLOT_REQUEST:
+            return scheduleLazy(vertices, executionGraph);
+
+        case EAGER:
+            return scheduleEager(vertices, executionGraph);
+
+        default:
+            throw new IllegalStateException(String.format("Schedule mode %s is invalid.", scheduleMode));
+    }
+}
+
+public static CompletableFuture<Void> scheduleEager(
+    final Iterable<ExecutionVertex> vertices,
+    final ExecutionGraph executionGraph) {
+
+    executionGraph.assertRunningInJobMasterMainThread();
+
+    checkState(executionGraph.getState() == JobStatus.RUNNING, "job is not running currently");
+
+    // Important: reserve all the space we need up front.
+    // that way we do not have any operation that can fail between allocating the slots
+    // and adding them to the list. If we had a failure in between there, that would
+    // cause the slots to get lost
+
+    // collecting all the slots may resize and fail in that operation without slots getting lost
+    final ArrayList<CompletableFuture<Execution>> allAllocationFutures = new ArrayList<>();
+
+    final SlotProviderStrategy slotProviderStrategy = executionGraph.getSlotProviderStrategy();
+    final Set<AllocationID> allPreviousAllocationIds = Collections.unmodifiableSet(
+        computePriorAllocationIdsIfRequiredByScheduling(vertices, slotProviderStrategy.asSlotProvider()));
+
+    // allocate the slots (obtain all their futures)
+    for (ExecutionVertex ev : vertices) {
+        // these calls are not blocking, they only return futures
+        CompletableFuture<Execution> allocationFuture = 
+            ev.getCurrentExecutionAttempt().allocateResourcesForExecution(
+            slotProviderStrategy,
+            LocationPreferenceConstraint.ALL,
+            allPreviousAllocationIds);
+
+        allAllocationFutures.add(allocationFuture);
+    }
+
+    // this future is complete once all slot futures are complete.
+    // the future fails once one slot future fails.
+    final ConjunctFuture<Collection<Execution>> allAllocationsFuture = 
+        FutureUtils.combineAll(allAllocationFutures);
+
+    return allAllocationsFuture.thenAccept(
+        (Collection<Execution> executionsToDeploy) -> {
+            //对所有的Execution分发的指定的TaskManager，根据Slot找到TaskManager
+            for (Execution execution : executionsToDeploy) {
+                try {
+                    //将单个task的submit到slot对应的TM
+                    execution.deploy();
+                } catch (Throwable t) {
+                    ...
+                }
+            }
+        })
+        // 部署出现异常则生成详细的部署异常信息
+        .exceptionally(
+        (Throwable throwable) -> {
+            ...
+        });
+}
+
+//Execution.java
+public void deploy() throws JobException {
+		assertRunningInJobMasterMainThread();
+
+		final LogicalSlot slot  = assignedResource;
+
+		// Check if the TaskManager died in the meantime
+		// This only speeds up the response to TaskManagers failing concurrently to deployments.
+		// The more general check is the rpcTimeout of the deployment call
+		if (!slot.isAlive()) {
+			throw new JobException("Target slot (TaskManager) for deployment is no longer alive.");
+		}
+
+		// make sure exactly one deployment call happens from the correct state
+		// note: the transition from CREATED to DEPLOYING is for testing purposes only
+		ExecutionState previous = this.state;
+		if (previous == SCHEDULED || previous == CREATED) {
+			if (!transitionState(previous, DEPLOYING)) {
+				// race condition, someone else beat us to the deploying call.
+				// this should actually not happen and indicates a race somewhere else
+				throw new IllegalStateException("Cannot deploy task: Concurrent deployment call race.");
+			}
+		}
+		else {
+			//异常， vertex被取消或者已经被调度了
+			
+		}
+
+		if (this != slot.getPayload()) {
+			throw new IllegalStateException(
+				String.format("The execution %s has not been assigned to the assigned slot.", this));
+		}
+
+		try {
+
+			// race double check, did we fail/cancel and do we need to release the slot?
+			if (this.state != DEPLOYING) {
+				slot.releaseSlot(new FlinkException("Actual state of execution " + this + " (" + state + ") does not match expected state DEPLOYING."));
+				return;
+			}
+
+			if (LOG.isInfoEnabled()) {
+				LOG.info(String.format("Deploying %s (attempt #%d) to %s", vertex.getTaskNameWithSubtaskIndex(),
+						attemptNumber, getAssignedResourceLocation()));
+			}
+			//生成TaskTaskDeploymentDescriptor
+			final TaskDeploymentDescriptor deployment = TaskDeploymentDescriptorFactory
+				.fromExecutionVertex(vertex, attemptNumber)
+				.createDeploymentDescriptor(
+					slot.getAllocationId(),
+					slot.getPhysicalSlotNumber(),
+					taskRestore,
+					producedPartitions.values());
+
+			// null taskRestore to let it be GC'ed
+			taskRestore = null;
+
+			final TaskManagerGateway taskManagerGateway = slot.getTaskManagerGateway();
+
+			final ComponentMainThreadExecutor jobMasterMainThreadExecutor =
+				vertex.getExecutionGraph().getJobMasterMainThreadExecutor();
+			//与TaskManagerGateway通讯，将Task发布到TaskManager
+			// We run the submission in the future executor so that the serialization of large TDDs does not block
+			// the main thread and sync back to the main thread once submission is completed.
+			CompletableFuture.supplyAsync(() -> taskManagerGateway.submitTask(deployment, rpcTimeout), executor)
+				.thenCompose(Function.identity())
+				.whenCompleteAsync(
+					(ack, failure) -> {
+						// 成功则不作处理，异常则记录异常信息
+						if (failure != null) {
+							//部署失败异常记录
+						}
+					},
+					jobMasterMainThreadExecutor);
+
+		}
+		catch (Throwable t) {
+			markFailed(t);
+			ExceptionUtils.rethrow(t);
+		}
+	}
+```
 
 
 
