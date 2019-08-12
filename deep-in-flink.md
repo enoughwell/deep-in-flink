@@ -10,8 +10,6 @@
 
 另，类似于Flink的分布式计算引擎，如Spark、Storm等在原理上是相近的，深入解析Flink的原理，尽量抽取通用的概念，使读者对于分布式计算引擎领域能够更深的认识，则是更深层次的追求。
 
-
-
 # Flink入门
 
 ## Flink是什么
@@ -3343,7 +3341,47 @@ Flink1.2.0及以上版本,如果没有使用作废的API，则没问题，1.2.0�
 
 ## Checkpoint源码解读
 
+#### 关键对象
+
+##### CheckpointCoordinator
+
+`CheckpointCoordinator`负责协调Flink Operator和State的分布式快照。当触发快照的时候，`CheckpointCoordinator`向Source Operator中注入Barrier消息，然后等待所有的Task通知Checkpoint确认完成，同时持有所有task在确认完成消息中上报的State句柄。
+
+##### Checkpoint消息
+
+![1565255102585](images/1565255102585.png)
+
+
+
+**关键属性**
+
+```java
+//检查点消息对应的JobID
+private final JobID job;
+
+//触发Checkpoint的Task的标识
+private final ExecutionAttemptID taskExecutionId;
+
+//检查点ID 
+private final long checkpointId;
+```
+
+
+
+| 消息类型                     | 传递                    | 说明                                                         |
+| ---------------------------- | ----------------------- | ------------------------------------------------------------ |
+| **TriggerCheckpoint**        | JobMaster->TaskExecutor | 向SourceOperator Task发送开启检查点消息                      |
+| **AcknowledgeCheckpoint**    | TaskExecutor->JobMaster | Task完成Checkpoint之后通知检查点已经完成                     |
+| **DeclineCheckpoint**        | TaskExecutor->JobMaster | 告诉检查点协调器，检查点的请求还没有能够被处理，这种情况通常发生于：某task已处于RUNNING状态，但在内部可能还没有准备好执行检查点。 |
+| **NotifyCheckpointComplete** | JobMaster->TaskExecutor | 告诉一个Task它的检查点已经得到完成确认，Task可以向第三方异步提交该检查点。 |
+
+
+
 ### Checkpoint生命周期
+
+
+
+
 
 #### 触发Checkpoint
 
@@ -3353,19 +3391,20 @@ Flink1.2.0及以上版本,如果没有使用作废的API，则没问题，1.2.0�
 
 Checkpoint是从SourceOperator触发，然后依次向下游触发。
 
-![1560303044681](/images/1560303044681.png)
+![1560303044681](./images/1560303044681.png)
 
 #### 触发Checkpoint过程
 
-•检查符合触发checkpoint的条件，例如如果禁止了周期性的checkpoint，尚未达到触发checkpoint的最小间隔等等，就直接return
+1. 检查符合触发checkpoint的条件，例如如果禁止了周期性的checkpoint，尚未达到触发checkpoint的最小间隔等等，就直接返回。
 
-•检查是否所有需要checkpoint和需要响应checkpoint的ACK（ack涉及到checkpoint的两阶段提交，后面会讲）的task都处于running状态，否则return
+2. 检查是否所有需要checkpoint和需要响应checkpoint的ACK（ack涉及到checkpoint的两阶段提交，后面会讲）的task都处于running状态，否则return
 
-•如果都符合，那么执行checkpointID = checkpointIdCounter.getAndIncrement();以生成一个新的id，然后生成一个PendingCheckpoint。PendingCheckpoint是一个启动了的checkpoint，但是还没有被确认。等到所有的task都确认了本次checkpoint，那么这个checkpoint对象将转化为一个CompletedCheckpoint。
+3. 如果都符合，那么执行checkpointID = checkpointIdCounter.getAndIncrement();以生成一个新的id，然后生成一个PendingCheckpoint。PendingCheckpoint是一个启动了的checkpoint，但是还没有被确认。等到所有的task都确认了本次checkpoint，那么这个checkpoint对象将转化为一个CompletedCheckpoint。
 
-•定义一个超时callback，如果checkpoint执行了很久还没完成，就把它取消
+4. 定义一个超时callback，如果checkpoint执行了很久还没完成，就把它取消
 
-•触发MasterHooks，用户可以定义一些额外的操作，用以增强checkpoint的功能（如准备和清理外部资源）
+5. 触发MasterHooks，用户可以定义一些额外的操作，用以增强checkpoint的功能（如准备和清理外部资源）
+
 
 **核心触发逻辑：**
 
@@ -3758,13 +3797,15 @@ public void acknowledgeCheckpoint(
 
 ##### CheckpointCoordinator响应完成Checkpoint事件
 
-1.之前提到，coordinator在触发checkpoint时，生成了一个PendingCheckpoint，保存了所有operator的id。
+1. 之前提到，coordinator在触发checkpoint时，生成了一个PendingCheckpoint，保存了所有operator的id。
 
-2.当PendingCheckpoint收到一个operator的完成checkpoint的消息时，它就把这个operator从未完成checkpoint的节点集合移动到已完成的集合。当所有的operator都报告完成了checkpoint时，CheckpointCoordinator会触发completePendingCheckpoint()方法，该方法做了以下事情：
+2. 当PendingCheckpoint收到一个operator的完成checkpoint的消息时，它就把这个operator从未完成checkpoint的节点集合移动到已完成的集合。当所有的operator都报告完成了checkpoint时，CheckpointCoordinator会触发completePendingCheckpoint()方法，该方法做了以下事情：
 
-- 把pendinCgCheckpoint转换为CompletedCheckpoint
-- 把CompletedCheckpoint加入已完成的检查点集合，并从未完成检查点集合删除该检查点
-- 再度向各个operator发出rpc，通知该检查点已完成
+   1) 把pendinCgCheckpoint转换为CompletedCheckpoint
+
+   2) 把CompletedCheckpoint加入已完成的检查点集合，并从未完成检查点集合删除该检查点
+
+   3) 再度向各个operator发出rpc，通知该检查点已完成
 
 ```java
 //响应消息，判断checkpoint是否完成或者丢弃
@@ -3798,7 +3839,7 @@ private void completePendingCheckpoint(PendingCheckpoint pendingCheckpoint) thro
 
 ## Flink图总览
 
-![1560325980049](/images/1560325980049.png)
+![1560325980049](./images/1560325980049.png)
 
 JobGraph 之上除了 StreamGraph 还有 OptimizedPlan。OptimizedPlan 是由 BatchAPI 转换而来的。StreamGraph 是由 StreamAPI 转换而来的。
 
@@ -10243,6 +10284,101 @@ Flink使用Calcite的Optimizer作为SQL优化器。
 
 ### Calcite内置的优化规则（待编写）
 
+### 通用优化
+
+#### Subplan重用
+
+Subplan重用是Blink中的一个特性，位于Flink的Blink-Planner中。在Flink中支持一个Job中执行多条SQL语句，如果多条SQL语句的计划树的子树（带有叶子结点）节点的diagest相同，那么只保留1个（最左侧的子树），即使是不同的树的子树也可以重用。这样可以降低数据读取、处理的成本，如下例所示：
+
+```
+	 Join                      Join
+   /      \                  /      \
+Filter1  Filter2          Filter1  Filter2
+  |        |        =>       \     /
+Project1 Project2            Project1
+  |        |                   |
+Scan1    Scan2               Scan1
+```
+
+上例中，左侧Project1-Scan1和Project2-Scan2经过计算，其digest完全相同，也就是说读取同样的数据，执行完全相同的处理逻辑，那么只保留1个就可以，否则会导致算力的浪费，最终优化优化后的结果如右图所示。
+
+**Subplan重用的触发点**
+
+```scala
+@VisibleForTesting
+  private[flink] def translateToExecNodePlan(
+      optimizedRelNodes: Seq[RelNode]): util.List[ExecNode[_, _]] = {
+    require(optimizedRelNodes.forall(_.isInstanceOf[FlinkPhysicalRel]))
+    // 将相同的RelNode重写为不通过的RelNode(对象不同但digest相同)，首先确保能够生成正确的DAG。
+    // (DAG重用基于计划对象一致，不是digest相同)
+    val shuttle = new SameRelObjectShuttle()
+    val relsWithoutSameObj = optimizedRelNodes.map(_.accept(shuttle))
+    // subplan去重
+    val reusedPlan = SubplanReuser.reuseDuplicatedSubplan(relsWithoutSameObj, config)
+    // 将 FlinkPhysicalRel DAG 转换为 ExecNode DAG
+    reusedPlan.map(_.asInstanceOf[ExecNode[_, _]])
+  }
+```
+
+#### Subplan重用示例（1.7版本）
+
+如下例所示，在同一个Job中执行了3个insert语句，insert的select部分存在相同的select 子句。
+
+```java
+public class TestTowInsert {
+    public static void main(String[] args) throws Exception {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamTableEnvironment tableEnv = StreamTableEnvironment.getTableEnvironment(env);
+        DataStream<Tuple2> sourceDataStream = env.fromElements(Tuple2.of(1,2),Tuple2.of(3,4));
+        tableEnv.registerDataStream("source",sourceDataStream,"id,number");
+        Table s1 = tableEnv.sqlQuery("select id, number from source where id < 10");
+        Table s3 = tableEnv.sqlQuery("select id, number from source").select("id");
+
+        tableEnv.registerTable("middle",s1);
+        tableEnv.registerTable("middle3",s3);
+
+        tableEnv.registerTableSink("sink1",
+                new CsvTableSink("D:/sink1.csv",",",2, FileSystem.WriteMode.OVERWRITE)
+                        .configure(new String[]{"id","number"},new TypeInformation[]{Types.INT,Types.INT})
+        );
+
+        tableEnv.registerTableSink("sink2",
+                new CsvTableSink("D:/sink2.csv",",",2, FileSystem.WriteMode.OVERWRITE)
+                        .configure(new String[]{"id","number"},new TypeInformation[]{Types.INT,Types.INT})
+        );
+
+        tableEnv.registerTableSink("sink3",
+                new CsvTableSink("D:/sink3.csv",",",1, FileSystem.WriteMode.OVERWRITE)
+                        .configure(new String[]{"id"},new TypeInformation[]{Types.INT});
+        );
+
+        tableEnv.sqlUpdate("insert into sink1 select * from middle");
+        tableEnv.sqlUpdate("insert into sink2 select * from middle");
+        tableEnv.sqlUpdate("insert into sink3 select * from middle3");
+        System.out.println(env.getExecutionPlan());
+        env.execute();
+    }
+}
+```
+
+**1.8版本及之前的StreamGraph**
+
+生成的`StreamGraph`如下，从图中明显可见，`Insert`语句共享了`DataSource Operator`。
+
+![1565597461185](images/1565597461185.png)
+
+> 本示例中是1.9版本之前的优化策略，只重用了Data Source。
+>
+> 1.9版本之后增加了Subplan重用，能够带来更大范围的重用。
+
+**1.9版本及之后的StreamGraph**
+
+在图中明显的看到，从DataSource开始，重复的部分被优化掉了，重复的子树只保留了一个，能够极大的减少数据重复计算的成本。
+
+![1565609793837](images/1565609793837.png)
+
+
+
 ### Stream优化
 
 `FlinkStreamRuleSets.scala`
@@ -10250,8 +10386,6 @@ Flink使用Calcite的Optimizer作为SQL优化器。
 #### Stream逻辑优化
 
 ##### 半连接join规则
-
-
 
 ```scala
 val SEMI_JOIN_RULES: RuleSet = RuleSets.ofList(
@@ -14532,4 +14666,80 @@ Flink 作业管理、调度、外部访问、提供Web UI服务的进程，进�
 新版本的Flink中每个JobManager对应于一个Job，为Job提供资源的申请、执行调度、checkpoint协调、异常处理等功能。JobManager实际上现在包装了JobMaster，JobMaster是行为的实际执行者。
 
 
+
+## Flink中的一些其它设计
+
+### ID设计
+
+Flin对所有需要进行唯一标识的组件、对象提供了抽象类`AbstractID`，因为需要跨网络进行传递，所以该类实现了`Serializable`接口，需要比较唯一标识是否相同，实现了`Comparable`接口。
+
+其继承关系如下：
+
+![1565256288849](images/1565256288849.png)
+
+## 分布式计算集群构型
+
+1. **计算任务的描述**
+
+   1）不同层次API接口，简化分布式计算集群的使用。从高到低的API层次：SQL、Table API、DataStream API、ProcessFunction。
+
+   2）API到可执行任务之间的转换
+
+   3）优化
+
+2. **计算任务的调度与执行**（核心）
+
+   1）计算任务的拆分和分发
+
+   2）异常处理
+
+   3）API到可执行任务之间的转换
+
+   4）可执行任务的优化
+
+   5）Exactly Once语义
+
+3. **计算资源**（核心）
+
+   1）CPU、内存、GPU
+
+   2）计算资源的管理
+
+4. **数据接入**
+
+   1）数据读取（connector）
+
+   2）数据写出（connector）
+
+5. **数据描述和序列化**（基础核心）
+
+   1）数据结构的描述（元数据）
+
+   2）数据序列化机制
+
+6. **内存管理**（基础核心）
+
+   1）内存管理机制，内存的申请和回收
+
+7. **通讯**（基础核心）
+
+   1）计算数据节点内、节点之间的交换。
+
+   2）管理数据的通讯。
+
+   计算数据和管理数据都需要RPC通讯框架。
+
+8. **分布式集群架构**（核心）
+
+   1）有中心、对等架构。
+
+   2）集群角色，控制中心、执行器。
+
+   3）HA
+
+9. **运维**
+
+   1）集群本身的管理，部署、启动、停止、升级、迁移。
+
+   2）计算任务的管理，发布、停止、升级、迁移。
 
