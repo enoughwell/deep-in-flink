@@ -9998,6 +9998,7 @@ Flink RelNode与Calcite RelNode的对应关系如下：
 | FlinkLogicalValues               | LogicalValues                    |                    |
 | FlinkLogicalWatermarkAssigner      | LogicalWatermarkAssigner      |                    |
 | FlinkLogicalWindowAggregate      | LogicalWindowAggregate      |                    |
+| FlinkLogicalWindowTableAggregate | 无 | WindowTableAggregate是Flink中新增的概念，Calcite中没有对应的概念 |
 
 
 
@@ -10104,6 +10105,7 @@ List<Transformation<?>> transformations =
 | FlinkLogicalValues               | StreamExecValues                    |                    |
 | FlinkLogicalWatermarkAssigner      | StreamExecWatermarkAssigner      |                    |
 | FlinkLogicalWindowAggregate      | StreamExecGroupWindowAggregate      |                    |
+| LogicalWindowTableAggregate | StreamExecGroupWindowTableAggregate | |
 
 **优化**
 StreamExecGroupAggregate可能会被优化为StreamExecGlobalGroupAggregate
@@ -10305,7 +10307,14 @@ Scan1    Scan2               Scan1
 **Subplan重用的触发点**
 
 ```scala
-@VisibleForTesting
+abstract class PlannerBase(
+    executor: Executor,
+    config: TableConfig,
+    val functionCatalog: FunctionCatalog,
+    catalogManager: CatalogManager,
+    isStreamingMode: Boolean)
+  extends Planner {  
+	@VisibleForTesting
   private[flink] def translateToExecNodePlan(
       optimizedRelNodes: Seq[RelNode]): util.List[ExecNode[_, _]] = {
     require(optimizedRelNodes.forall(_.isInstanceOf[FlinkPhysicalRel]))
@@ -10318,9 +10327,10 @@ Scan1    Scan2               Scan1
     // 将 FlinkPhysicalRel DAG 转换为 ExecNode DAG
     reusedPlan.map(_.asInstanceOf[ExecNode[_, _]])
   }
+}
 ```
 
-#### Subplan重用示例（1.7版本）
+#### Subplan重用示例
 
 如下例所示，在同一个Job中执行了3个insert语句，insert的select部分存在相同的select 子句。
 
@@ -11700,6 +11710,7 @@ reduce useless aggCall
     FlinkLogicalExpand.CONVERTER,
     FlinkLogicalWatermarkAssigner.CONVERTER,
     FlinkLogicalWindowAggregate.CONVERTER,
+    FlinkLogicalWindowTableAggregate.CONVERTER,
     FlinkLogicalSnapshot.CONVERTER,
     FlinkLogicalMatch.CONVERTER,
     FlinkLogicalSink.CONVERTER
@@ -11871,6 +11882,7 @@ Planner规则，对于包含**distinct**的聚合，例如 **count distinct**，
     StreamExecOverAggregateRule.INSTANCE,
     // window agg
     StreamExecGroupWindowAggregateRule.INSTANCE,
+    StreamExecGroupWindowTableAggregateRule.INSTANCE,
     // join
     StreamExecJoinRule.INSTANCE,
     StreamExecWindowJoinRule.INSTANCE,
@@ -12011,6 +12023,10 @@ Planner规则，对于包含**distinct**的聚合，例如 **count distinct**，
 - **StreamExecGroupWindowAggregateRule.INSTANCE**
 
   将`FlinkLogicalWindowAggregate`转换为`StreamExecGroupWindowAggregate`。
+  
+- **StreamExecGroupWindowTableAggregateRule.INSTANCE**
+
+  将`FlinkLogicalWindowTableAggregate`转换为`StreamExecGroupWindowTableAggregate`。
 
 **join**
 
