@@ -10282,9 +10282,254 @@ abstract class PlannerBase(
 
 ## SQL优化（待完善）
 
-Flink使用Calcite的Optimizer作为SQL优化器。
+### 优化器
 
-### Calcite内置的优化规则（待编写）
+blink中并没有使用Calcite的优化器`Optimizer`。
+
+![1565782452660](images/1565782452660.png)
+
+**CommonSubGraphBasedOptimizer**
+
+基于DAG的公共子图将原始的RelNode DAG优化为语义等价的RelNode DAG。什么是公共子图？首先子图就是一个逻辑计划树（Calcite RelNode Tree）的子树，公共子树就是多个逻辑计划树相同的子树。Calcite Planner不支持DAG（包含了多个sink）的优化，所以RelNode DAG需要被分解为多棵子树（每个子树一个root，即只有一个sink），每棵子树使用`org.apache.calcite.plan.RelOptPlanner`单独优化。
+
+优化算法的过程如下：
+
+1. 首先将 RelNode DAG分解为多个子树（Flink中对应的类为`RelNodeBlock`），然后生成一个RelNodeBlock DAG。每个RelNodeBlock只有一个Sink，代表一棵子树。
+2. 递归优化RelNodeBlock，优化顺序是从叶子结点（source）到root结点（sink）。非root子树（ RelNodeBlock）包装为一个`IntermediateRelTable`。
+3. 优化完成之后，将`IntermediateRelTable`重新展开生成优化后的RelNode DAG。
+
+目前，选择这种优化策略主要基于以下考虑：
+
+1. 一般来说，使用多sink的用户倾向于使用View，View天然就是一个公共子图。
+2. 经过优化之后，例如project 下推，filter下推，在最终的DAG中可能就没有公共子图了。
+
+当前策略可以改进的地方：
+
+1. 如何找到公共子图的切分点，例如一些Physical RelNode可能是从多个Ligcal RelNode转换而来，所以一个合法的切分点一定不在这几个Logcal RelNode之间。
+2. 优化结果是局部最优（每个子图内最优），不是全局最优。
+
+**StreamCommonSubGraphBasedOptimizer**
+
+流上的基于子图的优化器
+
+**BatchCommonSubGraphBasedOptimizer**
+
+批上基于子图的优化器
+
+
+
+#### **RelNodeBlock**
+
+`RelNodeBlock`是RelNode DAG的子树（子图），每个`RelNodeBlock`只有一个Sink输出。
+
+算法如下：
+
+1. 如果只有一个`RelNode`树，那么整个`RelNode`树就是一个`RelNodeBlock`。
+
+2. 重用不同`RelNode`树中的公共子树，生成一个RelNode DAG
+
+3. 从Root节点（sink节点）开始遍历每一棵树，为每个RelNode标记其Sink节点
+
+4. 再从root节点开始遍历每一棵树，遇到包含多个Sink节点的`RelNode`，该`RelNode`节点就是一个新的`RelNodeBlock`的输出节点（也叫作DAG的切分点break-point）。
+
+   不能当做切分点的几个特例：
+
+   1）当`RelNodeBlockPlanBuilder.TABLE_OPTIMIZER_UNIONALL_AS_BREAKPOINT_DISABLED`设置为`True`的时候，UnionAll不能当做切分点。
+
+   2） `TableFunctionScan`、`Snapshot`、或者 Window Agg（带有Window属性的`Aggregate`）不能当做切分点，因为他们的Physical RelNode是RelNode的组合，组合中的每一个RelNode不能单独优化。例如`FlinkLogicalTableFunctionScan`和 `FlinkLogicalCorrelate` 会被合并成一个 `BatchExecCorrelate` 或 `StreamExecCorrelate`，视运行模式而定。
+
+**示例**
+
+```scala
+//TableAPI 
+val sourceTable = tEnv.scan("test_table").select('a, 'b, 'c)
+val leftTable = sourceTable.filter('a > 0).select('a as 'a1, 'b as 'b1)
+val rightTable = sourceTable.filter('c.isNotNull).select('b as 'b2, 'c as 'c2)
+val joinTable = leftTable.join(rightTable, 'a1 === 'b2)
+joinTable.where('a1 >= 70).select('a1, 'b1).writeToSink(sink1)
+joinTable.where('a1 < 70 ).select('a1, 'c2).writeToSink(sink2)
+```
+
+上边Table API示例对应的RelNode DAG如下
+
+```json
+	Sink(sink1)     Sink(sink2)
+		|               |
+	 Project(a1,b1)  Project(a1,c2)
+		|               |
+	 Filter(a1>=70)  Filter(a1<70)
+		   \          /
+			Join(a1=b2)
+		   /           \
+	 Project(a1,b1)  Project(b2,c2)
+		  |             |
+	 Filter(a>0)     Filter(c is not null)
+		  \           /
+		  Project(a,b,c)
+			  	|
+		   	TableScan
+```
+
+该RelNode DAG会被分阶成3个`RelNodeBlock`，切分点是为`Join(a1=b2)`，在这个切分点上开始出现了两个Sink。
+
+> 虽然`Project(a,b,c)`也有两个父节点但是最后优化之后，会被合并到`Join(a1=b2)`中，所以`Project(a,b,c)`不是切分点，
+
+三个RelNodeBlock如下：
+
+![1565850086492](images/1565850086492.png)
+
+RelNodePlan树如下：
+
+```json
+	RelNodeBlock2  RelNodeBlock3
+          \            /
+          RelNodeBlock1
+```
+
+对RelNodePlan树进行优化的时候，从叶子节点开始向上依次优化每一个`RelNodeBlock`。
+
+#### FlinkOptimizeProgram
+
+![1565853480956](images/1565853480956.png)
+
+FlinkOptimizeProgram进行了多层的封装，但是实际上底层最终调用的是Calcite的`HepPlanner`和`VolcanoPlanner`。
+
+
+
+#### 优化过程
+
+```java
+TableEnvironmentImpl#execute() 
+
+-> TableEnvironmentImpl#translate 
+
+->  PlannerBase#translate() 
+
+-> PlannerBase#optimize() 
+
+-> CommonSubGraphBasedOptimizer#optimize()
+
+-> StreamCommonSubGraphBasedOptimizer#doOptimize()
+
+-> StreamCommonSubGraphBasedOptimizer#optimizeBlock()
+
+-> StreamCommonSubGraphBasedOptimizer#optimizeTree()
+
+//最终实际上是调用了Calcite的HepPlanner或者VolcanoPlanner
+
+-> FlinkOptimizeProgram#optimize()
+```
+
+
+
+### Calcite内置的优化规则
+
+**AbstractJoinExtractFilterRule**
+
+
+
+**AbstractMaterializedViewRule**
+
+**AggregateCaseToFilterRule**
+
+**AggregateExpandDistinctAggregatesRule**
+
+**AggregateExtractProjectRule**
+
+**AggregateFilterTransposeRule**
+
+**AggregateJoinJoinRemoveRule**
+
+**AggregateJoinRemoveRule**
+**AggregateJoinTransposeRule**
+**AggregateMergeRule**
+**AggregateProjectMergeRule**
+**AggregateProjectPullUpConstantsRule**
+**AggregateReduceFunctionsRule**
+**AggregateRemoveRule**
+**AggregateStarTableRule**
+**AggregateUnionAggregateRule**
+**AggregateUnionTransposeRule**
+**AggregateValuesRule**
+**CalcMergeRule**
+**CalcRelSplitter**
+**CalcRemoveRule**
+**CalcSplitRule**
+**CoerceInputsRule**
+**DateRangeRules**
+**EquiJoin**
+**ExchangeRemoveConstantKeysRule**
+**FilterAggregateTransposeRule**
+**FilterCalcMergeRule**
+**FilterCorrelateRule**
+**FilterJoinRule**
+**FilterMergeRule**
+**FilterMultiJoinMergeRule**
+**FilterProjectTransposeRule**
+**FilterRemoveIsNotDistinctFromRule**
+**FilterSetOpTransposeRule**
+**FilterTableFunctionTransposeRule**
+**FilterTableScanRule**
+**FilterToCalcRule**
+**IntersectToDistinctRule**
+**JoinAddRedundantSemiJoinRule**
+**JoinAssociateRule**
+**JoinCommuteRule**
+**JoinExtractFilterRule**
+**JoinProjectTransposeRule**
+**JoinPushExpressionsRule**
+**JoinPushThroughJoinRule**
+**JoinPushTransitivePredicatesRule**
+**JoinToCorrelateRule**
+**JoinToMultiJoinRule**
+**JoinUnionTransposeRule**
+**LoptJoinTree**
+**LoptMultiJoin**
+**LoptOptimizeJoinRule**
+**LoptSemiJoinOptimizer**
+**MatchRule**
+**MaterializedViewFilterScanRule**
+**MultiJoin**
+**MultiJoinOptimizeBushyRule**
+**MultiJoinProjectTransposeRule**
+**package-info**
+**ProjectCalcMergeRule**
+**ProjectCorrelateTransposeRule**
+**ProjectFilterTransposeRule**
+**ProjectJoinJoinRemoveRule**
+**ProjectJoinRemoveRule**
+**ProjectJoinTransposeRule**
+**ProjectMergeRule**
+**ProjectMultiJoinMergeRule**
+**ProjectRemoveRule**
+**ProjectSetOpTransposeRule**
+**ProjectSortTransposeRule**
+**ProjectTableScanRule**
+**ProjectToCalcRule**
+**ProjectToWindowRule**
+**ProjectWindowTransposeRule**
+**PruneEmptyRules**
+**PushProjector**
+**ReduceDecimalsRule**
+**ReduceExpressionsRule**
+**SemiJoinFilterTransposeRule**
+**SemiJoinJoinTransposeRule**
+**SemiJoinProjectTransposeRule**
+**SemiJoinRemoveRule**
+**SemiJoinRule**
+**SortJoinCopyRule**
+**SortJoinTransposeRule**
+**SortProjectTransposeRule**
+**SortRemoveConstantKeysRule**
+**SortRemoveRule**
+**SortUnionTransposeRule**
+**SubQueryRemoveRule**
+**TableScanRule**
+**UnionEliminatorRule**
+**UnionMergeRule**
+**UnionPullUpConstantsRule**
+**UnionToDistinctRule**
+**ValuesReduceRule**
 
 ### 通用优化
 
@@ -10298,8 +10543,8 @@ Subplan重用是Blink中的一个特性，位于Flink的Blink-Planner中。在Fl
 Filter1  Filter2          Filter1  Filter2
   |        |        =>       \     /
 Project1 Project2            Project1
-  |        |                   |
-Scan1    Scan2               Scan1
+  |        |                    |
+Scan1    Scan2                Scan1
 ```
 
 上例中，左侧Project1-Scan1和Project2-Scan2经过计算，其digest完全相同，也就是说读取同样的数据，执行完全相同的处理逻辑，那么只保留1个就可以，否则会导致算力的浪费，最终优化优化后的结果如右图所示。
